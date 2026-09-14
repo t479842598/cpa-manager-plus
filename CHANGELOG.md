@@ -8,7 +8,7 @@
 
 ---
 
-## 2026-09-14 — GPT-6 家族自动 Codex 身份头（模板标签 `whitelist-v7.2.159-norm2-gpt6`）
+## 2026-09-14 — GPT-6 家族自动 Codex 身份头（正式标签 `whitelist-v7.2.159-norm2-gpt6`，已部署生产）
 
 ### 新增
 
@@ -28,6 +28,21 @@
 
 - 干净 v7.2.159 worktree 重放补丁：`git apply --check` plain 通过、`go build ./...` 退出码 0、`go test ./internal/runtime/executor/ -run GPT6` 8 例全 PASS、`go vet` 无输出。
 - 已知失败测试 `TestOpenAICompatExecutorToolResultContentByInputModalities`（上游自带、4 子用例）已用**零改动干净 worktree** 对照复现，确认非本次引入。
+- **抓包 A/B（同一份「无 headers + cloaking 开启」配置）**：旧镜像发 `Originator: codex-tui`，新镜像发 `Originator: codex_exec`；同容器内非 GPT-6 的 `gpt-5.4-codex` 仍发 `codex-tui`（反向对照）。
+
+### 部署（2026-09-14 生产已切换）
+
+- 全量备份 `upgrade-v7.2.159-norm2-gpt6-20260914T031936Z`（含 CPAMP 卷 39 MB + 配置 + secrets + data + MANIFEST/sha256），异地副本三方 sha256 与服务器逐字节一致；`integrity_check`/`quick_check` 均 ok。
+- 服务器 arm64 构建 `eceasy/cli-proxy-api:whitelist-v7.2.159-norm2-gpt6`（`Commit: gpt6-20260914`）。
+- 8318 灰度与切换前逐项对照：四个客户端 key 模型数 6/4/8/5 不变、白名单外 403、management 200/401、流式 `[DONE]`+`finish_reason`、`panic`/`fatal` 0。
+- 切换后复测：`healthz` 200、CPAMP `/health` 本地与公网 200、公网 `天机阁/gpt-5.6-sol` 200；旧镜像保留作回滚锚点。
+- 详细记录见 [`docs/deployment.md`](docs/deployment.md) 的 2026-09-14 条目。
+
+### 已知限制
+
+- anyrouter 的 `gpt-6-astra` 当天持续 `500 get_channel_failed`（上游容量），切换前后一致；连续失败后 CPA 会短暂 `503 auth_unavailable`（凭证冷却），约 1 分钟后自动恢复。
+- 裸 `gpt-6-astra` 目前仅对 `api-keys` 中的 `tang1234` 放行（其白名单含该项），四个 `sk-*` 客户端 key 未包含，故 403 —— 配置现状，非本次改动引入。
+- WebSocket 传输（`websockets: true`）未接本规则。
 
 ---
 

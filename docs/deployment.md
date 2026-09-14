@@ -479,6 +479,68 @@ docker run --rm -v /opt/cpa/cli-config.yaml:/c.yaml python:3-slim \
 - CPA 有 config file watcher 会热加载，但**进程已退出时热加载无从谈起**；写坏配置 = 直接整机断服。
 - 排查口诀：nginx 502 + 面板 `server misbehaving` 同时出现 = **先看 `docker ps` 里 cli-proxy-api 是不是 Restarting**，再看它的日志首行报错（配置解析失败会直接打印行号）。
 
+### 2026-09-14 部署 GPT-6 自动 Codex 身份头（`whitelist-v7.2.159-norm2` → `whitelist-v7.2.159-norm2-gpt6`）
+
+**触发**：补丁新增「GPT-6 家族自动 Codex 身份头」（Spec `05-00-gpt6-auto-codex-identity`，ADR `scene:01-cpa-gateway/0001`），解决「别人安装二改 CPA 少配 headers / 少关 cloaking 就复现 anyrouter 400」的分发型配置依赖。补丁 18 → 22 文件，其余三类自研功能（白名单 / norm1 / norm2）不变。
+
+**升级前验证（干净 worktree + 抓包对照，零污染）**：
+- 22 文件补丁在 pristine v7.2.159 worktree 上 `git apply --check` plain 通过 → `go build ./...` 退出码 0 → `go test -run GPT6` **8 例全 PASS**；上游自带失败用例 `TestOpenAICompatExecutorToolResultContentByInputModalities` 用**零改动**干净 worktree 对照复现，确认非本次引入。
+- **抓包 A/B（决定性证据）**：用同一份「无 provider headers + cloaking 默认开启」的临时配置，把 `codex-api-key` 的 `base-url` 指向加入 `cpa_cpa-net` 的捕获容器，对照同一请求在旧/新镜像下 CPA 实际发出的头：
+
+| 镜像 | CPA 实际发出 |
+|---|---|
+| `whitelist-v7.2.159-norm2` | `Originator: codex-tui` / UA `codex-tui/0.154.0 …` |
+| `whitelist-v7.2.159-norm2-gpt6` | **`Originator: codex_exec`** / UA `codex_exec/0.154.0 …` |
+
+- **反向对照（同容器）**：非 GPT-6 的 Codex 模型 `gpt-5.4-codex` 仍发 `Originator: codex-tui`（零改动），同容器的 `gpt-6-astra` 发 `codex_exec` —— 证明规则按模型家族精准生效。
+- 注：`cpa-capture` 服务与临时配置（含生产 api-key）用完立即销毁删除，服务器残留 0。
+
+**备份**：`/opt/cpa/backups/upgrade-v7.2.159-norm2-gpt6-20260914T031936Z/`
+- 含 `cpamp-volume.tar.gz`（39 MB）、`cli-config.yaml`、`compose.yaml`、`secrets/`、`data/`、`MANIFEST.txt`（sha256）
+- 校验：`PRAGMA integrity_check = ok`、`quick_check = ok`、`data.key` 44 字节
+- 异地副本：`backup-remote/upgrade-v7.2.159-norm2-gpt6-20260914T031936Z/`，`cpamp-volume.tar.gz`（`24d5d452…`）/ `cli-config.yaml`（`63d84542…`）/ `compose.yaml`（`245e7fcf…`）与服务器 MANIFEST **逐字节一致**
+
+**构建**（服务器，源码包 `/tmp/cpa-gpt6build`，源码含 22 文件补丁）：
+```bash
+docker build --build-arg VERSION=v7.2.159 --build-arg COMMIT=gpt6-20260914 \
+  --build-arg BUILD_DATE=2026-09-14T03:25:00Z \
+  -t eceasy/cli-proxy-api:whitelist-v7.2.159-norm2-gpt6 .
+```
+启动日志：`CLIProxyAPI Version: v7.2.159, Commit: gpt6-20260914` + `21 clients (1 Codex keys + 20 OpenAI-compat)`。
+
+**8318 灰度（生产配置，与切换前逐项对照，全部一致）**：
+
+| 验证项 | 切换前基线 | 灰度（新镜像） | 切换后 |
+|---|---|---|---|
+| `/v1/models` 四个客户端 key | 6 / 4 / 8 / 5 | 6 / 4 / 8 / 5 | 6 / 4 / 8 / 5 |
+| 白名单外模型 | 403 `model_not_allowed` | 403 | 403 |
+| 白名单内模型 | 200 | 200 | 200（`天机阁/gpt-5.6-sol` 公网 200） |
+| `/v0/management/models` 带 key / 无 key | 200 / 401 | 200 / 401 | 200 / 401 |
+| 流式 chat（`FB/deepseek-v4-flash`） | 200，含 `[DONE]`+`finish_reason` | 同 | 同 |
+| 裸 `gpt-6-astra`（不在任何 sk- key 白名单） | 403 | 403 | 403 |
+| `panic` / `fatal` | 0 | 0 | 0 |
+
+**切换**：
+```bash
+cd /opt/cpa
+cp -a compose.yaml compose.yaml.bak-pre-v7.2.159-norm2-gpt6
+sed -i 's|eceasy/cli-proxy-api:whitelist-v7.2.159-norm2$|eceasy/cli-proxy-api:whitelist-v7.2.159-norm2-gpt6|' compose.yaml
+docker compose up -d --no-deps cli-proxy-api
+```
+
+**生产复测**：版本 `Commit: gpt6-20260914`；`healthz` 200；CPAMP `/health` 本地与公网均 200；四个 key 模型数与切换前一致；白名单外 403；公网 `api.274747.xyz` 的 `天机阁/gpt-5.6-sol` **200**；日志 `panic`/`fatal` 0。旧镜像 `eceasy/cli-proxy-api:whitelist-v7.2.159-norm2`（`f072d687e8ea`）保留作回滚锚点。
+
+**已知限制 / 观察**：
+- anyrouter 的 `gpt-6-astra` 当天持续返回 `500 get_channel_failed`（「负载已经达到上限」），**切换前后一致**，属上游容量问题，与本次改动无关。连续失败后 CPA 会短暂出现 `503 auth_unavailable`（凭证进入冷却），等待约 1 分钟后自动恢复为上游原报错。
+- 裸 `gpt-6-astra` 目前只对 `api-keys` 里的 `tang1234` 开放（该 key 的白名单含 `gpt-6-astra`）；四个 `sk-*` 客户端 key 未包含它，故一律 403 —— 这是白名单配置现状，不是本次改动引入。
+
+**回滚**：
+```bash
+cd /opt/cpa
+sed -i 's|eceasy/cli-proxy-api:whitelist-v7.2.159-norm2-gpt6$|eceasy/cli-proxy-api:whitelist-v7.2.159-norm2|' compose.yaml
+docker compose up -d --no-deps cli-proxy-api
+```
+
 ### 回滚
 
 ```bash
