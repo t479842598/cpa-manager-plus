@@ -1,0 +1,1681 @@
+diff --git a/internal/access/config_access/provider.go b/internal/access/config_access/provider.go
+index 915160b7..36be6a11 100644
+--- a/internal/access/config_access/provider.go
++++ b/internal/access/config_access/provider.go
+@@ -24,16 +24,17 @@ func Register(cfg *sdkconfig.SDKConfig) {
+ 
+ 	sdkaccess.RegisterProvider(
+ 		sdkaccess.AccessProviderTypeConfigAPIKey,
+-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
++		newProvider(sdkaccess.DefaultAccessProviderName, keys, cfg.APIKeyModels),
+ 	)
+ }
+ 
+ type provider struct {
+-	name string
+-	keys map[string]struct{}
++	name     string
++	keys     map[string]struct{}
++	keyModel map[string][]string
+ }
+ 
+-func newProvider(name string, keys []string) *provider {
++func newProvider(name string, keys []string, keyModel map[string][]string) *provider {
+ 	providerName := strings.TrimSpace(name)
+ 	if providerName == "" {
+ 		providerName = sdkaccess.DefaultAccessProviderName
+@@ -42,7 +43,11 @@ func newProvider(name string, keys []string) *provider {
+ 	for _, key := range keys {
+ 		keySet[key] = struct{}{}
+ 	}
+-	return &provider{name: providerName, keys: keySet}
++	normalizedKeyModel := make(map[string][]string, len(keyModel))
++	for k, models := range keyModel {
++		normalizedKeyModel[k] = normalizeModelList(models)
++	}
++	return &provider{name: providerName, keys: keySet, keyModel: normalizedKeyModel}
+ }
+ 
+ func (p *provider) Identifier() string {
+@@ -90,12 +95,16 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
+ 			continue
+ 		}
+ 		if _, ok := p.keys[candidate.value]; ok {
++			metadata := map[string]string{
++				"source": candidate.source,
++			}
++			if models := p.keyModel[candidate.value]; len(models) > 0 {
++				metadata["model-whitelist"] = strings.Join(models, ",")
++			}
+ 			return &sdkaccess.Result{
+ 				Provider:  p.Identifier(),
+ 				Principal: candidate.value,
+-				Metadata: map[string]string{
+-					"source": candidate.source,
+-				},
++				Metadata:  metadata,
+ 			}, nil
+ 		}
+ 	}
+@@ -139,3 +148,24 @@ func normalizeKeys(keys []string) []string {
+ 	}
+ 	return normalized
+ }
++
++// normalizeModelList trims, dedupes and drops blank model names.
++func normalizeModelList(models []string) []string {
++	if len(models) == 0 {
++		return nil
++	}
++	out := make([]string, 0, len(models))
++	seen := make(map[string]struct{}, len(models))
++	for _, m := range models {
++		m = strings.TrimSpace(m)
++		if m == "" {
++			continue
++		}
++		if _, exists := seen[m]; exists {
++			continue
++		}
++		seen[m] = struct{}{}
++		out = append(out, m)
++	}
++	return out
++}
+diff --git a/internal/api/handlers/management/models.go b/internal/api/handlers/management/models.go
+new file mode 100644
+index 00000000..1cac9235
+--- /dev/null
++++ b/internal/api/handlers/management/models.go
+@@ -0,0 +1,60 @@
++package management
++
++import (
++	"net/http"
++	"strings"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++)
++
++// managementModelsProtocol is the registry handler type used by the
++// OpenAI-compatible catalogue exposed on /v1/models.
++const managementModelsProtocol = "openai"
++
++// GetModels serves GET /v0/management/models.
++//
++// It returns the *full* model catalogue from the global registry. Unlike
++// GET /v1/models it is authenticated with the management secret key and is
++// deliberately NOT filtered by the per-key model whitelist (api-key-models).
++//
++// The control panel needs this endpoint because /v1/models is filtered per
++// key: when the first configured api key happens to be a restricted one,
++// probing /v1/models with it yields only that key's whitelist, so the panel
++// could no longer offer every model as a candidate while an administrator is
++// editing a whitelist. Reading the registry directly always yields the
++// complete list regardless of which keys are restricted.
++func (h *Handler) GetModels(c *gin.Context) {
++	protocol := strings.TrimSpace(c.Query("protocol"))
++	if protocol == "" {
++		protocol = managementModelsProtocol
++	}
++
++	models := registry.GetGlobalRegistry().GetAvailableModels(protocol)
++
++	data := make([]map[string]any, 0, len(models))
++	for _, model := range models {
++		id := ""
++		if v, ok := model["id"].(string); ok {
++			id = strings.TrimSpace(v)
++		}
++		if id == "" {
++			continue
++		}
++		item := map[string]any{"id": id, "object": model["object"]}
++		if v, ok := model["created"]; ok {
++			item["created"] = v
++		}
++		if v, ok := model["owned_by"]; ok {
++			item["owned_by"] = v
++		}
++		data = append(data, item)
++	}
++
++	c.JSON(http.StatusOK, gin.H{
++		"object":   "list",
++		"protocol": protocol,
++		"total":    len(data),
++		"data":     data,
++	})
++}
+diff --git a/internal/api/handlers/management/models_test.go b/internal/api/handlers/management/models_test.go
+new file mode 100644
+index 00000000..af41acf1
+--- /dev/null
++++ b/internal/api/handlers/management/models_test.go
+@@ -0,0 +1,123 @@
++package management
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
++)
++
++func registerManagementModelsTestClient(t *testing.T) (want, omitted string) {
++	t.Helper()
++	clientID := "management-models-test"
++	want = "mgmt-models-test/alpha"
++	omitted = "mgmt-models-test/beta"
++	registry.GetGlobalRegistry().RegisterClient(clientID, "OpenAI", []*registry.ModelInfo{
++		{ID: want, Object: "model", OwnedBy: "test"},
++		{ID: omitted, Object: "model", OwnedBy: "test"},
++	})
++	t.Cleanup(func() {
++		registry.GetGlobalRegistry().UnregisterClient(clientID)
++	})
++	return want, omitted
++}
++
++// F-02: GET /v0/management/models returns the full catalogue even when the
++// request context carries a per-key whitelist. This is the endpoint the control
++// panel relies on so that editing a whitelist is never limited to whatever the
++// first configured api key happens to be allowed to see.
++func TestGetModelsIgnoresPerKeyWhitelist(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	want, omitted := registerManagementModelsTestClient(t)
++
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	ctx := sdkaccess.WithAuthMetadata(context.Background(), map[string]string{
++		// Only one of the two registered models would survive a whitelist filter.
++		"model-whitelist": want,
++	})
++	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/models", nil).WithContext(ctx)
++
++	(&Handler{}).GetModels(c)
++
++	if recorder.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
++	}
++
++	var payload struct {
++		Object   string           `json:"object"`
++		Protocol string           `json:"protocol"`
++		Total    int              `json:"total"`
++		Data     []map[string]any `json:"data"`
++	}
++	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
++		t.Fatalf("decode: %v (%s)", err, recorder.Body.String())
++	}
++	if payload.Object != "list" {
++		t.Fatalf("object = %q, want list", payload.Object)
++	}
++	if payload.Protocol != "openai" {
++		t.Fatalf("protocol = %q, want openai", payload.Protocol)
++	}
++	if payload.Total != len(payload.Data) {
++		t.Fatalf("total = %d but data length = %d", payload.Total, len(payload.Data))
++	}
++
++	body := recorder.Body.String()
++	for _, id := range []string{want, omitted} {
++		if !strings.Contains(body, id) {
++			t.Fatalf("full catalogue should contain %q even with a whitelist on the context", id)
++		}
++	}
++}
++
++// F-02: entries are normalised to the public fields and blank ids are dropped.
++func TestGetModelsProjectsPublicFields(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	clientID := "management-models-projection"
++	wantID := "mgmt-models-test/projected"
++	registry.GetGlobalRegistry().RegisterClient(clientID, "OpenAI", []*registry.ModelInfo{
++		{ID: wantID, Object: "model", OwnedBy: "test-owner", Created: 1771111111, DisplayName: "Should Not Leak"},
++		{ID: "   ", Object: "model"},
++	})
++	t.Cleanup(func() {
++		registry.GetGlobalRegistry().UnregisterClient(clientID)
++	})
++
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/models", nil).WithContext(context.Background())
++
++	(&Handler{}).GetModels(c)
++
++	var payload struct {
++		Data []map[string]any `json:"data"`
++	}
++	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
++		t.Fatalf("decode: %v (%s)", err, recorder.Body.String())
++	}
++	var found map[string]any
++	for _, item := range payload.Data {
++		if id, _ := item["id"].(string); id == wantID {
++			found = item
++		}
++		if id, _ := item["id"].(string); strings.TrimSpace(id) == "" {
++			t.Fatalf("blank model id must be dropped, got %v", item)
++		}
++	}
++	if found == nil {
++		t.Fatalf("model %q missing from response", wantID)
++	}
++	if found["owned_by"] != "test-owner" {
++		t.Fatalf("owned_by = %v, want test-owner", found["owned_by"])
++	}
++	if _, ok := found["display_name"]; ok {
++		t.Fatalf("display_name must not be projected, got %v", found)
++	}
++}
+diff --git a/internal/api/server_management.go b/internal/api/server_management.go
+index 479eb226..e608a022 100644
+--- a/internal/api/server_management.go
++++ b/internal/api/server_management.go
+@@ -31,6 +31,9 @@ func (s *Server) registerManagementRoutes() {
+ 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
+ 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
+ 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
++		// Full model catalogue for the control panel's per-key whitelist editor.
++		// Deliberately unfiltered by api-key-models; see management.GetModels.
++		mgmt.GET("/models", s.mgmt.GetModels)
+ 		mgmt.GET("/plugins", s.mgmt.ListPlugins)
+ 		mgmt.GET("/plugin-store", s.mgmt.ListPluginStore)
+ 		mgmt.POST("/plugin-store/:id/install", s.mgmt.InstallPluginFromStore)
+diff --git a/internal/api/server_middleware.go b/internal/api/server_middleware.go
+index 447f280c..3f673627 100644
+--- a/internal/api/server_middleware.go
++++ b/internal/api/server_middleware.go
+@@ -170,6 +170,11 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
+ 				c.Set("accessProvider", result.Provider)
+ 				if len(result.Metadata) > 0 {
+ 					c.Set("accessMetadata", result.Metadata)
++					// Also carry the metadata on the request context so downstream
++					// execution paths (model whitelist checks) can read it without
++					// needing the gin context.
++					req := c.Request.WithContext(sdkaccess.WithAuthMetadata(c.Request.Context(), result.Metadata))
++					c.Request = req
+ 				}
+ 			}
+ 			c.Next()
+diff --git a/internal/config/sdk_config.go b/internal/config/sdk_config.go
+index 1c5a1bb6..833b75ac 100644
+--- a/internal/config/sdk_config.go
++++ b/internal/config/sdk_config.go
+@@ -54,6 +54,19 @@ type SDKConfig struct {
+ 	// APIKeys is a list of keys for authenticating clients to this proxy server.
+ 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+ 
++	// APIKeyModels optionally restricts which models each client API key may
++	// request. Keys are the API key values from api-keys; values are the list
++	// of allowed model names. An empty/missing entry means the key can access
++	// all models.
++	//
++	// Example:
++	//
++	//	api-key-models:
++	//	  sk-abc123:
++	//	    - deepseek-v4-flash
++	//	    - gpt-5.6-luna
++	APIKeyModels map[string][]string `yaml:"api-key-models,omitempty" json:"api-key-models,omitempty"`
++
+ 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
+ 	// Default is false (disabled).
+ 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
+diff --git a/internal/runtime/executor/codex_executor_execute.go b/internal/runtime/executor/codex_executor_execute.go
+index c68757d6..7efbcf96 100644
+--- a/internal/runtime/executor/codex_executor_execute.go
++++ b/internal/runtime/executor/codex_executor_execute.go
+@@ -82,6 +82,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
+ 		return resp, err
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
++	applyGPT6CodexIdentityHeaders(httpReq.Header, baseModel, baseURL, auth)
+ 	applyModelHeaderOverrides(httpReq.Header, baseModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+@@ -253,6 +254,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
+ 		return resp, err
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg, opts.Headers)
++	applyGPT6CodexIdentityHeaders(httpReq.Header, baseModel, baseURL, auth)
+ 	applyModelHeaderOverrides(httpReq.Header, baseModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+diff --git a/internal/runtime/executor/codex_executor_request.go b/internal/runtime/executor/codex_executor_request.go
+index 23f00eb5..491be116 100644
+--- a/internal/runtime/executor/codex_executor_request.go
++++ b/internal/runtime/executor/codex_executor_request.go
+@@ -25,6 +25,8 @@ import (
+ const (
+ 	codexUserAgent             = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+ 	codexOriginator            = "codex-tui"
++	codexExecUserAgent         = "codex_exec/0.154.0 (Mac OS 26.7.0; arm64) dumb (codex_exec; 0.154.0)"
++	codexExecOriginator        = "codex_exec"
+ 	codexDefaultImageToolModel = "gpt-image-2"
+ 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
+ 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
+@@ -377,6 +379,72 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
+ 	headers.Set("Originator", codexOriginator)
+ }
+ 
++// isGPT6FamilyModel reports whether the model id belongs to the GPT-6 family
++// (gpt-6, gpt-6-astra, gpt-6.0, prefixed names such as teamA/gpt-6-astra, and
++// thinking-suffixed ids).
++func isGPT6FamilyModel(model string) bool {
++	name := strings.ToLower(strings.TrimSpace(model))
++	if name == "" {
++		return false
++	}
++	if slash := strings.LastIndex(name, "/"); slash >= 0 {
++		name = name[slash+1:]
++	}
++	return name == "gpt-6" || strings.HasPrefix(name, "gpt-6-") || strings.HasPrefix(name, "gpt-6.")
++}
++
++// isOfficialCodexBaseURL reports whether the upstream base URL is the first-party
++// ChatGPT backend. An empty value means the executor default
++// (https://chatgpt.com/backend-api/codex).
++func isOfficialCodexBaseURL(baseURL string) bool {
++	trimmed := strings.ToLower(strings.TrimSpace(baseURL))
++	if trimmed == "" {
++		return true
++	}
++	return strings.Contains(trimmed, "chatgpt.com") || strings.Contains(trimmed, "openai.com")
++}
++
++// hasOperatorHeader reports whether the operator pinned the header explicitly through a
++// provider `headers:` block (surfaced as the `header:<name>` auth attribute).
++func hasOperatorHeader(auth *cliproxyauth.Auth, name string) bool {
++	if auth == nil || len(auth.Attributes) == 0 {
++		return false
++	}
++	for key := range auth.Attributes {
++		if !strings.HasPrefix(key, "header:") {
++			continue
++		}
++		if strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(key, "header:")), name) {
++			return true
++		}
++	}
++	return false
++}
++
++// applyGPT6CodexIdentityHeaders forces the Codex CLI (`codex_exec`) identity headers on
++// GPT-6 family requests, so third-party Codex relays that key their upstream channel off
++// `Originator` work out of the box, without per-provider `headers:` config or
++// `codex.disable-codex-cloaking`.
++//
++// It deliberately stays narrow:
++//   - only GPT-6 family model ids,
++//   - only for non-official upstreams (the first-party ChatGPT backend keeps its own identity),
++//   - and it yields to explicitly configured `Originator`/`User-Agent` provider headers and to
++//     models.json `config.override_header` (applied after this helper).
++func applyGPT6CodexIdentityHeaders(headers http.Header, model string, baseURL string, auth *cliproxyauth.Auth) {
++	if headers == nil || !isGPT6FamilyModel(model) || isOfficialCodexBaseURL(baseURL) {
++		return
++	}
++	if hasOperatorHeader(auth, "Originator") || hasOperatorHeader(auth, "User-Agent") {
++		return
++	}
++	headers.Set("Originator", codexExecOriginator)
++	headers.Set("User-Agent", codexExecUserAgent)
++	if codexSessionHeaderValue(headers) == "" {
++		headers.Set("Session_id", uuid.NewString())
++	}
++}
++
+ func normalizeCodexInstructions(body []byte) []byte {
+ 	instructions := gjson.GetBytes(body, "instructions")
+ 	if !instructions.Exists() || instructions.Type == gjson.Null {
+diff --git a/internal/runtime/executor/codex_executor_stream.go b/internal/runtime/executor/codex_executor_stream.go
+index 1ea663e0..82648c86 100644
+--- a/internal/runtime/executor/codex_executor_stream.go
++++ b/internal/runtime/executor/codex_executor_stream.go
+@@ -88,6 +88,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
+ 		return nil, err
+ 	}
+ 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
++	applyGPT6CodexIdentityHeaders(httpReq.Header, baseModel, baseURL, auth)
+ 	applyModelHeaderOverrides(httpReq.Header, baseModel)
+ 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+ 	var authID, authLabel, authType, authValue string
+diff --git a/internal/runtime/executor/gpt6_codex_identity_test.go b/internal/runtime/executor/gpt6_codex_identity_test.go
+new file mode 100644
+index 00000000..323b271f
+--- /dev/null
++++ b/internal/runtime/executor/gpt6_codex_identity_test.go
+@@ -0,0 +1,226 @@
++package executor
++
++import (
++	"net/http"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++)
++
++func TestIsGPT6FamilyModel(t *testing.T) {
++	cases := []struct {
++		model string
++		want  bool
++	}{
++		{"gpt-6-astra", true},
++		{"gpt-6", true},
++		{"gpt-6.0", true},
++		{"gpt-6-astra(high)", true},
++		{"teamA/gpt-6-astra", true},
++		{"GPT-6-Astra", true},
++		{" gpt-6-astra ", true},
++		{"gpt-5.5", false},
++		{"gpt-5.6-luna", false},
++		{"gpt-6x", false},
++		{"", false},
++		{"claude-sonnet-5", false},
++	}
++	for _, tc := range cases {
++		if got := isGPT6FamilyModel(tc.model); got != tc.want {
++			t.Errorf("isGPT6FamilyModel(%q) = %t, want %t", tc.model, got, tc.want)
++		}
++	}
++}
++
++func TestApplyGPT6CodexIdentityHeaders(t *testing.T) {
++	cases := []struct {
++		name       string
++		model      string
++		baseURL    string
++		auth       *cliproxyauth.Auth
++		wantOrigin string
++	}{
++		{
++			name:       "gpt6 custom relay gets codex_exec identity",
++			model:      "gpt-6-astra",
++			baseURL:    "https://anyrouter.top/v1",
++			auth:       &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"auth_kind": "apikey"}},
++			wantOrigin: codexExecOriginator,
++		},
++		{
++			name:       "gpt6 suffixed model on custom relay",
++			model:      "gpt-6-astra(xhigh)",
++			baseURL:    "https://relay.example.com/v1",
++			wantOrigin: codexExecOriginator,
++		},
++		{
++			name:       "prefixed gpt6 model on custom relay",
++			model:      "teamA/gpt-6-astra",
++			baseURL:    "https://relay.example.com/v1",
++			wantOrigin: codexExecOriginator,
++		},
++		{
++			name:       "official chatgpt backend keeps codex-tui identity",
++			model:      "gpt-6-astra",
++			baseURL:    "https://chatgpt.com/backend-api/codex",
++			wantOrigin: codexOriginator,
++		},
++		{
++			name:       "empty base url means official default",
++			model:      "gpt-6-astra",
++			baseURL:    "",
++			wantOrigin: codexOriginator,
++		},
++		{
++			name:       "non gpt6 model on custom relay untouched",
++			model:      "gpt-5.5",
++			baseURL:    "https://relay.example.com/v1",
++			wantOrigin: codexOriginator,
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			headers := http.Header{}
++			headers.Set("Originator", codexOriginator)
++			headers.Set("User-Agent", codexUserAgent)
++
++			applyGPT6CodexIdentityHeaders(headers, tc.model, tc.baseURL, tc.auth)
++
++			if got := headers.Get("Originator"); got != tc.wantOrigin {
++				t.Fatalf("Originator = %q, want %q", got, tc.wantOrigin)
++			}
++			wantCodexExec := tc.wantOrigin == codexExecOriginator
++			if got := headers.Get("User-Agent"); wantCodexExec && got != codexExecUserAgent {
++				t.Fatalf("User-Agent = %q, want %q", got, codexExecUserAgent)
++			} else if !wantCodexExec && got != codexUserAgent {
++				t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
++			}
++			session := codexSessionHeaderValue(headers)
++			if wantCodexExec && session == "" {
++				t.Fatal("expected Session_id to be set together with the codex_exec identity")
++			}
++			if !wantCodexExec && session != "" {
++				t.Fatalf("Session_id = %q, want empty for non GPT-6 / official upstream", session)
++			}
++		})
++	}
++}
++
++// The codex_exec identity must survive cloaking: cloaking runs first inside
++// applyCodexHeaders, then the GPT-6 rule rewrites the identity.
++func TestApplyGPT6CodexIdentityOverridesCloaking(t *testing.T) {
++	req, err := http.NewRequest(http.MethodPost, "https://anyrouter.top/v1/responses", nil)
++	if err != nil {
++		t.Fatalf("NewRequest() error = %v", err)
++	}
++	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"auth_kind": "apikey"}}
++	cfg := &config.Config{}
++
++	applyCodexHeaders(req, auth, "sk-test", true, cfg)
++	if got := req.Header.Get("Originator"); got != codexOriginator {
++		t.Fatalf("precondition: Originator after cloaking = %q, want %q", got, codexOriginator)
++	}
++
++	applyGPT6CodexIdentityHeaders(req.Header, "gpt-6-astra", "https://anyrouter.top/v1", auth)
++
++	if got := req.Header.Get("Originator"); got != codexExecOriginator {
++		t.Fatalf("Originator = %q, want %q", got, codexExecOriginator)
++	}
++	if got := req.Header.Get("User-Agent"); got != codexExecUserAgent {
++		t.Fatalf("User-Agent = %q, want %q", got, codexExecUserAgent)
++	}
++}
++
++// A client-sent Originator (e.g. a ZCode/browser style header) must not leak upstream
++// for GPT-6 requests: the relay keys its channel off that header.
++func TestApplyGPT6CodexIdentityDropsClientOriginator(t *testing.T) {
++	req, err := http.NewRequest(http.MethodPost, "https://anyrouter.top/v1/responses", nil)
++	if err != nil {
++		t.Fatalf("NewRequest() error = %v", err)
++	}
++	req.Header.Set("Originator", "codex_cli_rs")
++	req.Header.Set("User-Agent", "zcode/1.0")
++	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"auth_kind": "apikey"}}
++
++	applyGPT6CodexIdentityHeaders(req.Header, "gpt-6-astra", "https://anyrouter.top/v1", auth)
++
++	if got := req.Header.Get("Originator"); got != codexExecOriginator {
++		t.Fatalf("Originator = %q, want %q", got, codexExecOriginator)
++	}
++	if got := req.Header.Get("User-Agent"); got != codexExecUserAgent {
++		t.Fatalf("User-Agent = %q, want %q", got, codexExecUserAgent)
++	}
++}
++
++// An operator who pinned Originator / User-Agent through the provider `headers:` block
++// keeps full control - the automatic GPT-6 rule must not fight explicit config.
++func TestApplyGPT6CodexIdentityYieldsToOperatorHeaders(t *testing.T) {
++	cases := []struct {
++		name  string
++		attrs map[string]string
++	}{
++		{name: "originator pinned", attrs: map[string]string{"auth_kind": "apikey", "header:Originator": "codex_cli_rs"}},
++		{name: "user agent pinned", attrs: map[string]string{"auth_kind": "apikey", "header:user-agent": "my-relay/1.0"}},
++		{name: "lowercase originator pinned", attrs: map[string]string{"auth_kind": "apikey", "header:originator": "codex-tui"}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			headers := http.Header{}
++			headers.Set("Originator", codexOriginator)
++			headers.Set("User-Agent", codexUserAgent)
++			auth := &cliproxyauth.Auth{Provider: "codex", Attributes: tc.attrs}
++
++			applyGPT6CodexIdentityHeaders(headers, "gpt-6-astra", "https://anyrouter.top/v1", auth)
++
++			if got := headers.Get("Originator"); got != codexOriginator {
++				t.Fatalf("Originator = %q, want operator value %q", got, codexOriginator)
++			}
++			if got := headers.Get("User-Agent"); got != codexUserAgent {
++				t.Fatalf("User-Agent = %q, want operator value %q", got, codexUserAgent)
++			}
++		})
++	}
++}
++
++// models.json `config.override_header` is applied after the GPT-6 rule and must win.
++func TestApplyGPT6CodexIdentityYieldsToModelOverrideHeaders(t *testing.T) {
++	reg := registry.GetGlobalRegistry()
++	clientID := "test-gpt6-model-override"
++	reg.RegisterClient(clientID, "codex", []*registry.ModelInfo{{
++		ID: "gpt-6-testoverride",
++		Config: &registry.ModelConfig{
++			OverrideHeader: map[string]string{
++				"user-agent": "pinned-ua/1.0",
++				"originator": "pinned-origin",
++			},
++		},
++	}})
++	t.Cleanup(func() { reg.UnregisterClient(clientID) })
++
++	headers := http.Header{}
++	applyGPT6CodexIdentityHeaders(headers, "gpt-6-testoverride", "https://relay.example.com/v1", nil)
++	if got := headers.Get("Originator"); got != codexExecOriginator {
++		t.Fatalf("Originator = %q, want %q before override", got, codexExecOriginator)
++	}
++
++	applyModelHeaderOverrides(headers, "gpt-6-testoverride")
++
++	if got := headers.Get("Originator"); got != "pinned-origin" {
++		t.Fatalf("Originator = %q, want pinned-origin", got)
++	}
++	if got := headers.Get("User-Agent"); got != "pinned-ua/1.0" {
++		t.Fatalf("User-Agent = %q, want pinned-ua/1.0", got)
++	}
++}
++
++func TestApplyGPT6CodexIdentityNilInputs(t *testing.T) {
++	applyGPT6CodexIdentityHeaders(nil, "gpt-6-astra", "https://anyrouter.top/v1", nil)
++
++	headers := http.Header{}
++	applyGPT6CodexIdentityHeaders(headers, "", "https://anyrouter.top/v1", nil)
++	if len(headers) != 0 {
++		t.Fatalf("headers = %#v, want empty for blank model", headers)
++	}
++}
+diff --git a/internal/runtime/executor/openai_compat_executor.go b/internal/runtime/executor/openai_compat_executor.go
+index 6c770034..9bd20080 100644
+--- a/internal/runtime/executor/openai_compat_executor.go
++++ b/internal/runtime/executor/openai_compat_executor.go
+@@ -305,6 +305,59 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
+ 	return resp, nil
+ }
+ 
++// openAIStreamTerminalInfo inspects an upstream OpenAI chat-completion chunk and
++// reports whether it carries a non-null finish_reason, tool-call deltas, and any
++// choice object at all. Used to detect upstreams that close a stream without a
++// terminal finish_reason chunk, which strict OpenAI clients (e.g. pi-ai) reject.
++func openAIStreamTerminalInfo(payload []byte) (hasFinish bool, hasToolCalls bool, hasChoice bool) {
++	choices := gjson.GetBytes(payload, "choices")
++	if !choices.IsArray() {
++		return
++	}
++	choices.ForEach(func(_, choice gjson.Result) bool {
++		hasChoice = true
++		if fr := choice.Get("finish_reason"); fr.Exists() && fr.Type == gjson.String && fr.String() != "" {
++			hasFinish = true
++		}
++		if tc := choice.Get("delta.tool_calls"); tc.Exists() && tc.IsArray() && len(tc.Array()) > 0 {
++			hasToolCalls = true
++		}
++		return true
++	})
++	return
++}
++
++// synthesizeOpenAIStreamFinish builds an OpenAI chat-completion chunk carrying a
++// terminal finish_reason ("tool_calls" when tool-call deltas were streamed,
++// otherwise "stop"). It is injected before [DONE] when the upstream ended a
++// clean stream without ever sending one, so downstream translators and clients
++// observe a protocol-complete termination.
++func synthesizeOpenAIStreamFinish(id, model string, hasToolCalls bool) []byte {
++	reason := "stop"
++	if hasToolCalls {
++		reason = "tool_calls"
++	}
++	if id == "" {
++		id = "chatcmpl-" + strings.ReplaceAll(uuid.NewString(), "-", "")
++	}
++	chunk := map[string]any{
++		"id":      id,
++		"object":  "chat.completion.chunk",
++		"created": time.Now().Unix(),
++		"model":   model,
++		"choices": []any{map[string]any{
++			"index":         0,
++			"delta":         map[string]any{},
++			"finish_reason": reason,
++		}},
++	}
++	body, err := json.Marshal(chunk)
++	if err != nil {
++		return nil
++	}
++	return body
++}
++
+ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+ 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
+ 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
+@@ -428,6 +481,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+ 		var streamAborted bool
+ 		var upstreamEvent string
+ 		var frameData [][]byte
++		// Terminal-frame repair state: some OpenAI-compatible upstreams end a
++		// complete stream without ever sending a finish_reason chunk.
++		var sawFinishReason bool
++		var sawToolCallDelta bool
++		var sawStreamContent bool
++		var streamChunkID string
++		var streamChunkModel string
+ 		defer streamUsage.Publish(ctx, reporter)
+ 
+ 		publishStreamError := func(streamErr statusErr, containsPayload bool) {
+@@ -444,6 +504,33 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+ 			streamFailed = true
+ 		}
+ 
++		// publishSyntheticFinish injects a terminal finish_reason chunk when the
++		// upstream ended a clean stream without one. It must run before the
++		// [DONE] marker so the translator still sees an open stream state.
++		publishSyntheticFinish := func() {
++			if sawFinishReason || !sawStreamContent {
++				return
++			}
++			model := streamChunkModel
++			if model == "" {
++				model = baseModel
++			}
++			synth := synthesizeOpenAIStreamFinish(streamChunkID, model, sawToolCallDelta)
++			if synth == nil {
++				return
++			}
++			sawFinishReason = true
++			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, append([]byte("data: "), synth...), &param, claudeInputTokens)
++			for i := range chunks {
++				select {
++				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
++				case <-ctx.Done():
++					streamAborted = true
++					return
++				}
++			}
++		}
++
+ 		processFrame := func() bool {
+ 			eventName := upstreamEvent
+ 			upstreamEvent = ""
+@@ -480,6 +567,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+ 					publishStreamError(streamErr, true)
+ 					return true
+ 				}
++				if !sawFinishReason || !sawToolCallDelta || !sawStreamContent {
++					hasFinish, hasToolCalls, hasChoice := openAIStreamTerminalInfo(dataPayload)
++					sawFinishReason = sawFinishReason || hasFinish
++					sawToolCallDelta = sawToolCallDelta || hasToolCalls
++					sawStreamContent = sawStreamContent || hasChoice
++				}
++				if streamChunkID == "" {
++					streamChunkID = gjson.GetBytes(dataPayload, "id").String()
++				}
++				if streamChunkModel == "" {
++					streamChunkModel = gjson.GetBytes(dataPayload, "model").String()
++				}
++			} else {
++				publishSyntheticFinish()
++				if streamAborted {
++					return true
++				}
+ 			}
+ 
+ 			streamLine := append([]byte("data: "), dataPayload...)
+@@ -556,6 +660,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+ 			}
+ 
+ 			// Other protocols retain compatibility with providers that omit [DONE].
++			publishSyntheticFinish()
++			if streamAborted {
++				return
++			}
+ 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param, claudeInputTokens)
+ 			for i := range chunks {
+ 				select {
+diff --git a/internal/runtime/executor/openai_compat_executor_finish_test.go b/internal/runtime/executor/openai_compat_executor_finish_test.go
+new file mode 100644
+index 00000000..af91a3bf
+--- /dev/null
++++ b/internal/runtime/executor/openai_compat_executor_finish_test.go
+@@ -0,0 +1,132 @@
++package executor
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
++	"github.com/tidwall/gjson"
++)
++
++// runFinishRepairStream serves the given SSE body through an OpenAI-compatible
++// upstream and returns the translated payloads the executor publishes.
++func runFinishRepairStream(t *testing.T, sseBody string) []string {
++	t.Helper()
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = w.Write([]byte(sseBody))
++	}))
++	defer server.Close()
++
++	exec := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
++	auth := &cliproxyauth.Auth{
++		Provider: "openai-compatibility",
++		Attributes: map[string]string{
++			"base_url": server.URL + "/v1",
++			"api_key":  "test",
++		},
++	}
++	result, errExecute := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "FB/deepseek-v4-flash",
++		Payload: []byte(`{"model":"FB/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}`),
++	}, cliproxyexecutor.Options{
++		SourceFormat:   sdktranslator.FromString("openai"),
++		ResponseFormat: sdktranslator.FromString("openai"),
++		Stream:         true,
++	})
++	if errExecute != nil {
++		t.Fatalf("ExecuteStream error: %v", errExecute)
++	}
++	var payloads []string
++	for chunk := range result.Chunks {
++		if chunk.Err != nil {
++			t.Fatalf("stream chunk error: %v", chunk.Err)
++		}
++		payloads = append(payloads, string(chunk.Payload))
++	}
++	return payloads
++}
++
++func countFinishReasonChunks(payloads []string) int {
++	n := 0
++	for _, p := range payloads {
++		if fr := gjson.Get(p, "choices.0.finish_reason"); fr.Exists() && fr.Type == gjson.String && fr.String() != "" {
++			n++
++		}
++	}
++	return n
++}
++
++func TestOpenAICompatExecutorSynthesizesMissingFinishReason(t *testing.T) {
++	// Upstream streams complete content but ends without any finish_reason chunk.
++	payloads := runFinishRepairStream(t,
++		"data: {\"id\":\"chatcmpl-x1\",\"model\":\"FB/deepseek-v4-flash\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n"+
++			"data: {\"id\":\"chatcmpl-x1\",\"model\":\"FB/deepseek-v4-flash\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n"+
++			"data: [DONE]\n\n")
++	if got := countFinishReasonChunks(payloads); got != 1 {
++		t.Fatalf("finish_reason chunks = %d, want 1; payloads=%v", got, payloads)
++	}
++	last := payloads[len(payloads)-1]
++	if fr := gjson.Get(last, "choices.0.finish_reason").String(); fr != "stop" {
++		t.Fatalf("synthesized finish_reason = %q, want stop; payload=%s", fr, last)
++	}
++	if id := gjson.Get(last, "id").String(); id != "chatcmpl-x1" {
++		t.Fatalf("synthesized chunk id = %q, want chatcmpl-x1", id)
++	}
++	if m := gjson.Get(last, "model").String(); m != "FB/deepseek-v4-flash" {
++		t.Fatalf("synthesized chunk model = %q", m)
++	}
++}
++
++func TestOpenAICompatExecutorSynthesizesToolCallsFinishReason(t *testing.T) {
++	payloads := runFinishRepairStream(t,
++		"data: {\"id\":\"chatcmpl-x2\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n"+
++			"data: [DONE]\n\n")
++	if got := countFinishReasonChunks(payloads); got != 1 {
++		t.Fatalf("finish_reason chunks = %d, want 1; payloads=%v", got, payloads)
++	}
++	last := payloads[len(payloads)-1]
++	if fr := gjson.Get(last, "choices.0.finish_reason").String(); fr != "tool_calls" {
++		t.Fatalf("synthesized finish_reason = %q, want tool_calls; payload=%s", fr, last)
++	}
++}
++
++func TestOpenAICompatExecutorKeepsExistingFinishReason(t *testing.T) {
++	payloads := runFinishRepairStream(t,
++		"data: {\"id\":\"chatcmpl-x3\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"+
++			"data: {\"id\":\"chatcmpl-x3\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
++			"data: [DONE]\n\n")
++	if got := countFinishReasonChunks(payloads); got != 1 {
++		t.Fatalf("finish_reason chunks = %d, want 1 (no duplicate synthesis); payloads=%v", got, payloads)
++	}
++	if !strings.Contains(payloads[len(payloads)-1], "\"finish_reason\":\"stop\"") {
++		t.Fatalf("last payload should be the upstream finish chunk, got %s", payloads[len(payloads)-1])
++	}
++}
++
++func TestOpenAICompatExecutorSynthesizesOnEOFWithoutDone(t *testing.T) {
++	// Clean EOF without [DONE]: the executor already synthesizes [DONE]; the
++	// missing finish_reason must also be repaired before that marker.
++	payloads := runFinishRepairStream(t,
++		"data: {\"id\":\"chatcmpl-x4\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tail\"},\"finish_reason\":null}]}\n\n")
++	if got := countFinishReasonChunks(payloads); got != 1 {
++		t.Fatalf("finish_reason chunks = %d, want 1; payloads=%v", got, payloads)
++	}
++	if fr := gjson.Get(payloads[len(payloads)-1], "choices.0.finish_reason").String(); fr != "stop" {
++		t.Fatalf("synthesized finish_reason = %q, want stop", fr)
++	}
++}
++
++func TestOpenAICompatExecutorEmptyStreamNotSynthesized(t *testing.T) {
++	// No content chunks at all: do not fabricate a terminal event.
++	payloads := runFinishRepairStream(t, "data: [DONE]\n\n")
++	if got := countFinishReasonChunks(payloads); got != 0 {
++		t.Fatalf("finish_reason chunks = %d, want 0 for empty stream; payloads=%v", got, payloads)
++	}
++}
+diff --git a/internal/translator/openai/openai/chat-completions/openai_openai_request.go b/internal/translator/openai/openai/chat-completions/openai_openai_request.go
+index dd3ee5ab..9b6ba7b6 100644
+--- a/internal/translator/openai/openai/chat-completions/openai_openai_request.go
++++ b/internal/translator/openai/openai/chat-completions/openai_openai_request.go
+@@ -3,6 +3,9 @@
+ package chat_completions
+ 
+ import (
++	"fmt"
++	"strings"
++
+ 	"github.com/tidwall/gjson"
+ 	"github.com/tidwall/sjson"
+ )
+@@ -10,6 +13,16 @@ import (
+ // ConvertOpenAIRequestToOpenAI converts an OpenAI Chat Completions request (raw JSON)
+ // into a complete OpenAI request JSON. All JSON construction uses sjson and lookups use gjson.
+ //
++// In addition to locking the model name, it normalizes message shapes that strict upstreams
++// (e.g. DeepSeek-thinking-family or serde-based gateways) reject verbatim:
++//   - `developer` role -> `system` (many upstreams only accept system/user/assistant/tool)
++//   - assistant `content` arrays carrying `thinking`/`redacted_thinking`/`reasoning` blocks
++//     are flattened into a top-level `reasoning_content` string, and the visible content is
++//     reduced to its text parts.
++//   - every assistant message is guaranteed to carry a `reasoning_content` field (empty when
++//     absent), because DeepSeek thinking mode rejects assistant history without it
++//     ("must be passed back to the API").
++//
+ // Parameters:
+ //   - modelName: The name of the model to use for the request
+ //   - rawJSON: The raw JSON request data from the OpenAI API
+@@ -18,19 +31,121 @@ import (
+ // Returns:
+ //   - []byte: The transformed request data in OpenAI API format
+ func ConvertOpenAIRequestToOpenAI(modelName string, inputRawJSON []byte, _ bool) []byte {
+-	currentModel := gjson.GetBytes(inputRawJSON, "model")
+-	if currentModel.Type == gjson.String && currentModel.String() == modelName {
+-		return inputRawJSON
++	// Fast path: when the model already matches and no normalization is required, return the
++	// caller's slice so we do not force an extra copy (existing tests rely on this identity).
++	out := inputRawJSON
++	changed := false
++
++	if currentModel := gjson.GetBytes(out, "model"); currentModel.Type != gjson.String || currentModel.String() != modelName {
++		updated, err := sjson.SetBytes(out, "model", modelName)
++		if err != nil {
++			return inputRawJSON
++		}
++		out = updated
++		changed = true
++	}
++
++	normalized, normalizedChanged := normalizeOpenAIChatMessages(out)
++	if normalizedChanged {
++		out = normalized
++		changed = true
+ 	}
+ 
+-	// Update the "model" field in the JSON payload with the provided modelName
+-	// The sjson.SetBytes function returns a new byte slice with the updated JSON.
+-	updatedJSON, err := sjson.SetBytes(inputRawJSON, "model", modelName)
+-	if err != nil {
+-		// If there's an error, return the original JSON or handle the error appropriately.
+-		// For now, we'll return the original, but in a real scenario, logging or a more robust error
+-		// handling mechanism would be needed.
++	if !changed {
+ 		return inputRawJSON
+ 	}
+-	return updatedJSON
++	return out
++}
++
++// normalizeOpenAIChatMessages rewrites the messages array into a shape accepted by strict
++// OpenAI-compatible upstreams. It is a no-op for plain string-content messages, so common
++// requests are returned untouched. It returns the resulting body and whether it changed.
++func normalizeOpenAIChatMessages(body []byte) ([]byte, bool) {
++	messages := gjson.GetBytes(body, "messages")
++	if !messages.IsArray() {
++		return body, false
++	}
++
++	out := body
++	changed := false
++
++	for i, m := range messages.Array() {
++		role := m.Get("role").String()
++		path := fmt.Sprintf("messages.%d", i)
++
++		// Some upstreams (serde/Rust based) only accept system/user/assistant/tool and reject
++		// the OpenAI/Codex `developer` role. Map it to system, which is semantically equivalent.
++		if role == "developer" {
++			out, _ = sjson.SetBytes(out, path+".role", "system")
++			changed = true
++			role = "system"
++		}
++
++		if role != "assistant" {
++			continue
++		}
++
++		// Preserve any pre-existing top-level reasoning_content as the first reasoning segment.
++		var reasoningParts []string
++		existingRC := m.Get("reasoning_content")
++		if existingRC.Exists() && existingRC.String() != "" {
++			reasoningParts = append(reasoningParts, existingRC.String())
++		}
++
++		content := m.Get("content")
++		var textParts []string
++		removedFromArray := false
++
++		if content.IsArray() {
++			for _, block := range content.Array() {
++				switch block.Get("type").String() {
++				case "thinking", "redacted_thinking":
++					t := block.Get("thinking").String()
++					if t == "" {
++						t = block.Get("data").String()
++					}
++					if t == "" {
++						t = block.Get("text").String()
++					}
++					if t != "" {
++						reasoningParts = append(reasoningParts, t)
++						removedFromArray = true
++					}
++				case "reasoning":
++					// Compatible with clients that send {type:"reasoning", text:"..."}.
++					if t := block.Get("text").String(); t != "" {
++						reasoningParts = append(reasoningParts, t)
++						removedFromArray = true
++					}
++				case "text", "output_text":
++					if t := block.Get("text").String(); t != "" {
++						textParts = append(textParts, t)
++					}
++				}
++			}
++		}
++
++		joined := strings.Join(reasoningParts, "")
++
++		// DeepSeek thinking mode requires every assistant history message to carry a
++		// reasoning_content field, even an empty string. Missing it triggers a 400
++		// "must be passed back". Always ensure the field is present with the joined value.
++		if !existingRC.Exists() || existingRC.String() != joined {
++			out, _ = sjson.SetBytes(out, path+".reasoning_content", joined)
++			changed = true
++		}
++
++		// If the content array carried thinking blocks, fold the visible content back to a
++		// plain text string so we don't leave unknown block types to the upstream.
++		if content.IsArray() && removedFromArray {
++			out, _ = sjson.SetBytes(out, path+".content", strings.Join(textParts, ""))
++			changed = true
++		} else if joined != "" && (content.Type == gjson.Null || !content.Exists()) {
++			// A message with reasoning but a null/missing content is invalid for some upstreams.
++			out, _ = sjson.SetBytes(out, path+".content", "")
++			changed = true
++		}
++	}
++
++	return out, changed
+ }
+diff --git a/internal/translator/openai/openai/chat-completions/openai_openai_request_test.go b/internal/translator/openai/openai/chat-completions/openai_openai_request_test.go
+index 80a71a28..afcb51e3 100644
+--- a/internal/translator/openai/openai/chat-completions/openai_openai_request_test.go
++++ b/internal/translator/openai/openai/chat-completions/openai_openai_request_test.go
+@@ -25,3 +25,53 @@ func TestConvertOpenAIRequestToOpenAIUpdatesDifferentModel(t *testing.T) {
+ 		t.Fatalf("model = %q, want new-model", model)
+ 	}
+ }
++
++func TestConvertOpenAIRequestToOpenAIMapsDeveloperRoleToSystem(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[{"role":"developer","content":"be helpful"},{"role":"user","content":"hi"}]}`)
++
++	output := ConvertOpenAIRequestToOpenAI("m", input, false)
++
++	if role := gjson.GetBytes(output, "messages.0.role").String(); role != "system" {
++		t.Fatalf("role = %q, want system", role)
++	}
++	if role := gjson.GetBytes(output, "messages.1.role").String(); role != "user" {
++		t.Fatalf("messages.1.role = %q, want user", role)
++	}
++}
++
++func TestConvertOpenAIRequestToOpenAIFlattensAssistantThinkingBlocks(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"reasoning here"},{"type":"text","text":"visible answer"}]},{"role":"user","content":"go"}]}`)
++
++	output := ConvertOpenAIRequestToOpenAI("m", input, false)
++
++	if rc := gjson.GetBytes(output, "messages.1.reasoning_content").String(); rc != "reasoning here" {
++		t.Fatalf("reasoning_content = %q, want reasoning here", rc)
++	}
++	if content := gjson.GetBytes(output, "messages.1.content").String(); content != "visible answer" {
++		t.Fatalf("content = %q, want visible answer", content)
++	}
++}
++
++func TestConvertOpenAIRequestToOpenAIEnsuresEmptyReasoningContent(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"go"}]}`)
++
++	output := ConvertOpenAIRequestToOpenAI("m", input, false)
++
++	if rc := gjson.GetBytes(output, "messages.1.reasoning_content").String(); rc != "" {
++		t.Fatalf("reasoning_content = %q, want empty string", rc)
++	}
++}
++
++func TestConvertOpenAIRequestToOpenAIPreservesUserImageContent(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aaa"}}]}]}`)
++
++	output := ConvertOpenAIRequestToOpenAI("m", input, false)
++
++	// User messages must stay untouched (no thinking flattening, no reasoning_content injected).
++	if gjson.GetBytes(output, "messages.0.content.1.type").String() != "image_url" {
++		t.Fatalf("image_url block lost: %s", gjson.GetBytes(output, "messages.0.content").Raw)
++	}
++	if gjson.GetBytes(output, "messages.0.reasoning_content").Exists() {
++		t.Fatalf("user message must not get reasoning_content")
++	}
++}
+diff --git a/sdk/access/apikey_metadata.go b/sdk/access/apikey_metadata.go
+new file mode 100644
+index 00000000..d75fcc59
+--- /dev/null
++++ b/sdk/access/apikey_metadata.go
+@@ -0,0 +1,84 @@
++package access
++
++import (
++	"context"
++	"strings"
++)
++
++// apiKeyMetadataContextKey carries the authenticated API key metadata (including
++// the optional model whitelist) on the request context so downstream execution
++// paths can enforce per-key model restrictions without the gin context.
++type apiKeyMetadataContextKeyType struct{}
++
++var apiKeyMetadataContextKey apiKeyMetadataContextKeyType
++
++// apiKeyModelWhitelistContextKey carries the parsed model whitelist slice for the
++// authenticated API key, or nil when the key has no whitelist configured.
++type apiKeyModelWhitelistContextKeyType struct{}
++
++var apiKeyModelWhitelistContextKey apiKeyModelWhitelistContextKeyType
++
++// ContextKeyModelWhitelist returns the typed context key used to carry the parsed
++// model whitelist. It is exported so middleware in other packages can set the
++// value with a shared key.
++func ContextKeyModelWhitelist() any { return apiKeyModelWhitelistContextKey }
++
++// ContextKeyMetadata returns the typed context key used to carry the raw auth
++// metadata map.
++func ContextKeyMetadata() any { return apiKeyMetadataContextKey }
++
++// WithAuthMetadata attaches the auth result metadata to ctx.
++func WithAuthMetadata(ctx context.Context, metadata map[string]string) context.Context {
++	if ctx == nil || len(metadata) == 0 {
++		return ctx
++	}
++	ctx = context.WithValue(ctx, apiKeyMetadataContextKey, metadata)
++	if raw, ok := metadata["model-whitelist"]; ok && raw != "" {
++		var models []string
++		for _, part := range strings.Split(raw, ",") {
++			if m := strings.TrimSpace(part); m != "" {
++				models = append(models, m)
++			}
++		}
++		if len(models) > 0 {
++			ctx = context.WithValue(ctx, apiKeyModelWhitelistContextKey, models)
++		}
++	}
++	return ctx
++}
++
++// ModelWhitelistFromContext returns the model whitelist for the authenticated
++// API key, or nil when the key is unrestricted or no metadata was attached.
++func ModelWhitelistFromContext(ctx context.Context) []string {
++	if ctx == nil {
++		return nil
++	}
++	if v, ok := ctx.Value(apiKeyModelWhitelistContextKey).([]string); ok {
++		return v
++	}
++	if meta, ok := ctx.Value(apiKeyMetadataContextKey).(map[string]string); ok {
++		if raw, ok := meta["model-whitelist"]; ok && raw != "" {
++			var models []string
++			for _, part := range strings.Split(raw, ",") {
++				if m := strings.TrimSpace(part); m != "" {
++					models = append(models, m)
++				}
++			}
++			if len(models) > 0 {
++				return models
++			}
++		}
++	}
++	return nil
++}
++
++// MetadataFromContext returns the raw auth metadata map attached to ctx (nil if none).
++func MetadataFromContext(ctx context.Context) map[string]string {
++    if ctx == nil {
++        return nil
++    }
++    if meta, ok := ctx.Value(apiKeyMetadataContextKey).(map[string]string); ok {
++        return meta
++    }
++    return nil
++}
+diff --git a/sdk/api/handlers/handlers.go b/sdk/api/handlers/handlers.go
+index 32b21f8c..8374ed2f 100644
+--- a/sdk/api/handlers/handlers.go
++++ b/sdk/api/handlers/handlers.go
+@@ -4,6 +4,8 @@
+ package handlers
+ 
+ import (
++
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+ 	"bytes"
+ 	"encoding/json"
+ 	"fmt"
+@@ -480,6 +482,17 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
+ 		requestCtx = c.Request.Context()
+ 	}
+ 
++	// Carry the authenticated API key metadata (e.g. per-key model whitelist)
++	// from the request context into the new context: callers derive their
++	// execution context from context.Background(), which would otherwise drop it.
++	newParent := parentCtx
++	if meta := sdkaccess.MetadataFromContext(requestCtx); len(meta) > 0 {
++		newParent = sdkaccess.WithAuthMetadata(newParent, meta)
++	}
++
++	newCtx, cancel := context.WithCancel(newParent)
++
++
+ 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
+ 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
+ 			parentCtx = logging.WithRequestID(parentCtx, requestID)
+@@ -487,8 +500,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
+ 			parentCtx = logging.WithRequestID(parentCtx, requestID)
+ 		}
+ 	}
+-	newCtx, cancel := context.WithCancel(parentCtx)
+-
++	
+ 	endpoint := ""
+ 	if c != nil && c.Request != nil {
+ 		path := strings.TrimSpace(c.FullPath())
+diff --git a/sdk/api/handlers/handlers_execution.go b/sdk/api/handlers/handlers_execution.go
+index 6e46e435..41eea48e 100644
+--- a/sdk/api/handlers/handlers_execution.go
++++ b/sdk/api/handlers/handlers_execution.go
+@@ -56,6 +56,9 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
+ 	if errMsg != nil {
+ 		return nil, nil, errMsg
+ 	}
++	if whitelistErr := h.enforceModelWhitelist(ctx, normalizedModel); whitelistErr != nil {
++		return nil, nil, whitelistErr
++	}
+ 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+ 	reqMeta := requestExecutionMetadata(ctx)
+ 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+diff --git a/sdk/api/handlers/handlers_model_whitelist_test.go b/sdk/api/handlers/handlers_model_whitelist_test.go
+new file mode 100644
+index 00000000..a951c4ad
+--- /dev/null
++++ b/sdk/api/handlers/handlers_model_whitelist_test.go
+@@ -0,0 +1,113 @@
++package handlers
++
++import (
++	"context"
++	"net/http"
++	"strings"
++	"testing"
++
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
++)
++
++// newWhitelistHandler builds a BaseAPIHandler with the minimal wiring that
++// enforceModelWhitelist needs (it only reads the context and its receiver).
++func newWhitelistHandler() *BaseAPIHandler {
++	return &BaseAPIHandler{Cfg: &config.SDKConfig{}}
++}
++
++func ctxWithWhitelist(models ...string) context.Context {
++	return sdkaccess.WithAuthMetadata(context.Background(), map[string]string{
++		"model-whitelist": strings.Join(models, ","),
++	})
++}
++
++// F-05: a restricted key must be refused for models outside its whitelist.
++func TestEnforceModelWhitelistRejectsModelOutsideWhitelist(t *testing.T) {
++	h := newWhitelistHandler()
++	ctx := ctxWithWhitelist("hublinuxdo/deepseek-v4-flash", "天机阁/gpt-5.4")
++
++	msg := h.enforceModelWhitelist(ctx, "FB/glm-5.3-flash")
++	if msg == nil {
++		t.Fatal("expected an error for a model outside the whitelist, got nil")
++	}
++	if msg.StatusCode != http.StatusForbidden {
++		t.Fatalf("StatusCode = %d, want %d", msg.StatusCode, http.StatusForbidden)
++	}
++	body := msg.Error.Error()
++	for _, want := range []string{"model_not_allowed", "invalid_request_error", "FB/glm-5.3-flash"} {
++		if !strings.Contains(body, want) {
++			t.Fatalf("error body %q does not contain %q", body, want)
++		}
++	}
++	if !strings.Contains(body, `"param":"model"`) {
++		t.Fatalf("error body %q should point at the model param", body)
++	}
++}
++
++// F-05: a model inside the whitelist must pass.
++func TestEnforceModelWhitelistAllowsListedModel(t *testing.T) {
++	h := newWhitelistHandler()
++	ctx := ctxWithWhitelist("hublinuxdo/deepseek-v4-flash", "天机阁/gpt-5.4")
++
++	if msg := h.enforceModelWhitelist(ctx, "hublinuxdo/deepseek-v4-flash"); msg != nil {
++		t.Fatalf("expected allow for a whitelisted model, got %+v", msg)
++	}
++}
++
++// Surrounding whitespace in either the configured whitelist or the requested
++// model must not change the decision (keys are hand-edited in config.yaml).
++func TestEnforceModelWhitelistTrimsWhitespace(t *testing.T) {
++	h := newWhitelistHandler()
++	ctx := sdkaccess.WithAuthMetadata(context.Background(), map[string]string{
++		"model-whitelist": "  hublinuxdo/deepseek-v4-flash , 天机阁/gpt-5.4  ",
++	})
++
++	if msg := h.enforceModelWhitelist(ctx, "  hublinuxdo/deepseek-v4-flash  "); msg != nil {
++		t.Fatalf("expected padded whitelisted model to pass, got %+v", msg)
++	}
++	if msg := h.enforceModelWhitelist(ctx, "  FB/glm-5.3-flash  "); msg == nil {
++		t.Fatal("expected padded non-whitelisted model to be rejected")
++	}
++}
++
++// An unrestricted key (no metadata attached at all) must never be limited.
++func TestEnforceModelWhitelistNoopForUnrestrictedKey(t *testing.T) {
++	h := newWhitelistHandler()
++
++	if msg := h.enforceModelWhitelist(context.Background(), "anything/at-all"); msg != nil {
++		t.Fatalf("expected nil for an unrestricted key, got %+v", msg)
++	}
++	// Empty metadata map must not create a whitelist either.
++	empty := sdkaccess.WithAuthMetadata(context.Background(), map[string]string{})
++	if msg := h.enforceModelWhitelist(empty, "anything/at-all"); msg != nil {
++		t.Fatalf("expected nil for empty metadata, got %+v", msg)
++	}
++}
++
++// Defensive edges: nil context / nil model name must not lock the request out.
++func TestEnforceModelWhitelistIgnoresEmptyInputs(t *testing.T) {
++	h := newWhitelistHandler()
++	ctx := ctxWithWhitelist("hublinuxdo/deepseek-v4-flash")
++
++	if msg := h.enforceModelWhitelist(ctx, "   "); msg != nil {
++		t.Fatalf("expected nil for a blank model name, got %+v", msg)
++	}
++	if msg := h.enforceModelWhitelist(nil, "hublinuxdo/deepseek-v4-flash"); msg != nil {
++		t.Fatalf("expected nil for a nil context, got %+v", msg)
++	}
++	var nilHandler *BaseAPIHandler
++	if msg := nilHandler.enforceModelWhitelist(ctx, "hublinuxdo/deepseek-v4-flash"); msg != nil {
++		t.Fatalf("expected nil for a nil receiver, got %+v", msg)
++	}
++}
++
++// A whitelist made only of blanks behaves like no whitelist at all.
++func TestEnforceModelWhitelistBlankEntriesAreUnrestricted(t *testing.T) {
++	h := newWhitelistHandler()
++	ctx := sdkaccess.WithAuthMetadata(context.Background(), map[string]string{"model-whitelist": " , , "})
++
++	if msg := h.enforceModelWhitelist(ctx, "anything/at-all"); msg != nil {
++		t.Fatalf("blank whitelist entries should leave the key unrestricted, got %+v", msg)
++	}
++}
+diff --git a/sdk/api/handlers/handlers_routing.go b/sdk/api/handlers/handlers_routing.go
+index b4e7d9f8..fe0e48f7 100644
+--- a/sdk/api/handlers/handlers_routing.go
++++ b/sdk/api/handlers/handlers_routing.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+ 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+ 	"golang.org/x/net/context"
+@@ -101,6 +102,40 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
+ 	return h.getRequestDetailsWithOptions(modelName, false)
+ }
+ 
++// enforceModelWhitelist returns an error when the authenticated API key has a
++// model whitelist configured and modelName is not in it. When the key is
++// unrestricted (no whitelist) or no metadata is attached, it returns nil.
++func (h *BaseAPIHandler) enforceModelWhitelist(ctx context.Context, modelName string) *interfaces.ErrorMessage {
++	if ctx == nil || h == nil {
++		return nil
++	}
++	whitelist := sdkaccess.ModelWhitelistFromContext(ctx)
++	if len(whitelist) == 0 {
++		return nil
++	}
++	requested := strings.TrimSpace(modelName)
++	if requested == "" {
++		return nil
++	}
++	allowed := make(map[string]struct{}, len(whitelist))
++	for _, m := range whitelist {
++		allowed[strings.TrimSpace(m)] = struct{}{}
++	}
++	if _, ok := allowed[requested]; ok {
++		return nil
++	}
++	body := `{"error":{"message":"","type":"invalid_request_error","code":"model_not_allowed","param":"model"}}`
++	msg := fmt.Sprintf("model %q is not allowed for this API key", requested)
++	body, errSet := sjson.Set(body, "error.message", msg)
++	if errSet != nil {
++		body = `{"error":{"message":"model not allowed for this API key","type":"invalid_request_error","code":"model_not_allowed","param":"model"}}`
++	}
++	return &interfaces.ErrorMessage{
++		StatusCode: http.StatusForbidden,
++		Error:      errors.New(body),
++	}
++}
++
+ func validateNativeInteractionsExecution(entryProtocol string, execOptions modelExecutionOptions, routeDecision modelRouteDecision) *interfaces.ErrorMessage {
+ 	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
+ 	if forcedProvider == "" || entryProtocol != Interactions {
+diff --git a/sdk/api/handlers/handlers_stream.go b/sdk/api/handlers/handlers_stream.go
+index 2653e07a..c3ff5578 100644
+--- a/sdk/api/handlers/handlers_stream.go
++++ b/sdk/api/handlers/handlers_stream.go
+@@ -317,6 +317,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
+ 		close(errChan)
+ 		return nil, nil, errChan
+ 	}
++	if whitelistErr := h.enforceModelWhitelist(ctx, normalizedModel); whitelistErr != nil {
++		errChan := make(chan *interfaces.ErrorMessage, 1)
++		errChan <- whitelistErr
++		close(errChan)
++		return nil, nil, errChan
++	}
+ 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+ 	reqMeta := requestExecutionMetadata(ctx)
+ 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+diff --git a/sdk/api/handlers/openai/openai_handlers.go b/sdk/api/handlers/openai/openai_handlers.go
+index ccbef50a..977afb73 100644
+--- a/sdk/api/handlers/openai/openai_handlers.go
++++ b/sdk/api/handlers/openai/openai_handlers.go
+@@ -7,6 +7,10 @@
+ package openai
+ 
+ import (
++
++	"strings"
++
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -68,6 +72,26 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
+ 	// Get all available models
+ 	allModels := h.Models()
+ 
++	// Per-key model whitelist (api-key-models): when the authenticated key has
++	// one configured, only expose those models in the list.
++	if whitelist := sdkaccess.ModelWhitelistFromContext(c.Request.Context()); len(whitelist) > 0 {
++		allowed := make(map[string]struct{}, len(whitelist))
++		for _, name := range whitelist {
++			allowed[strings.TrimSpace(name)] = struct{}{}
++		}
++		restricted := make([]map[string]any, 0, len(whitelist))
++		for _, model := range allModels {
++			id := ""
++			if v, ok := model["id"].(string); ok {
++				id = strings.TrimSpace(v)
++			}
++			if _, ok := allowed[id]; ok {
++				restricted = append(restricted, model)
++			}
++		}
++		allModels = restricted
++	}
++
+ 	// Filter to only include the 4 required fields: id, object, created, owned_by
+ 	filteredModels := make([]map[string]any, len(allModels))
+ 	for i, model := range allModels {
+diff --git a/sdk/api/handlers/openai/openai_models_whitelist_test.go b/sdk/api/handlers/openai/openai_models_whitelist_test.go
+new file mode 100644
+index 00000000..1a9f7712
+--- /dev/null
++++ b/sdk/api/handlers/openai/openai_models_whitelist_test.go
+@@ -0,0 +1,109 @@
++package openai
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
++)
++
++// registerWhitelistTestModels adds uniquely-named models to the global registry
++// so the assertions below stay valid regardless of what other tests registered.
++func registerWhitelistTestModels(t *testing.T) (first, second, outside string) {
++	t.Helper()
++	id := "whitelist-test-client"
++	first = "whitelist-test/alpha"
++	second = "whitelist-test/beta"
++	outside = "whitelist-test/gamma"
++	registry.GetGlobalRegistry().RegisterClient(id, "OpenAI", []*registry.ModelInfo{
++		{ID: first, Object: "model", OwnedBy: "test"},
++		{ID: second, Object: "model", OwnedBy: "test"},
++		{ID: outside, Object: "model", OwnedBy: "test"},
++	})
++	t.Cleanup(func() {
++		registry.GetGlobalRegistry().UnregisterClient(id)
++	})
++	return
++}
++
++func modelIDsFromResponse(t *testing.T, body []byte) []string {
++	t.Helper()
++	var payload struct {
++		Object string           `json:"object"`
++		Data   []map[string]any `json:"data"`
++	}
++	if err := json.Unmarshal(body, &payload); err != nil {
++		t.Fatalf("decode response: %v (%s)", err, body)
++	}
++	if payload.Object != "list" {
++		t.Fatalf("object = %q, want list", payload.Object)
++	}
++	ids := make([]string, 0, len(payload.Data))
++	for _, m := range payload.Data {
++		if v, ok := m["id"].(string); ok {
++			ids = append(ids, v)
++		}
++	}
++	return ids
++}
++
++// F-06: /v1/models must expose only the whitelisted models for a restricted key.
++func TestOpenAIModelsFiltersByPerKeyWhitelist(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	first, second, outside := registerWhitelistTestModels(t)
++
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	ctx := sdkaccess.WithAuthMetadata(context.Background(), map[string]string{
++		"model-whitelist": first + "," + second,
++	})
++	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil).WithContext(ctx)
++
++	(&OpenAIAPIHandler{}).OpenAIModels(c)
++
++	if recorder.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200", recorder.Code)
++	}
++	ids := modelIDsFromResponse(t, recorder.Body.Bytes())
++	set := make(map[string]struct{}, len(ids))
++	for _, v := range ids {
++		set[v] = struct{}{}
++	}
++	if _, ok := set[first]; !ok {
++		t.Fatalf("whitelisted model %q missing from %v", first, ids)
++	}
++	if _, ok := set[second]; !ok {
++		t.Fatalf("whitelisted model %q missing from %v", second, ids)
++	}
++	if _, ok := set[outside]; ok {
++		t.Fatalf("non-whitelisted model %q must not be listed, got %v", outside, ids)
++	}
++}
++
++// F-06: an unrestricted key keeps seeing the full catalogue.
++func TestOpenAIModelsUnrestrictedKeySeesAllRegistered(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	first, _, outside := registerWhitelistTestModels(t)
++
++	recorder := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(recorder)
++	c.Request = httptest.NewRequest(http.MethodGet, "/v1/models", nil).WithContext(context.Background())
++
++	(&OpenAIAPIHandler{}).OpenAIModels(c)
++
++	if recorder.Code != http.StatusOK {
++		t.Fatalf("status = %d, want 200", recorder.Code)
++	}
++	body := recorder.Body.String()
++	for _, want := range []string{first, outside} {
++		if !strings.Contains(body, want) {
++			t.Fatalf("unrestricted key should see %q, body missing it", want)
++		}
++	}
++}

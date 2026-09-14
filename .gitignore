@@ -1,0 +1,56 @@
+# ============================================================
+# 本目录含生产密钥与加密数据，切勿纳入 git / 对外分享
+#
+# 建立背景（2026-09-13）：本目录当时**不是** git 仓库（无 commit / 无 remote /
+# 从未外传），但 README 与 docs 里存在明文凭证、backup-remote/ 下有完整
+# cli-config.yaml 与含 data.key 的加密卷包。为防将来误执行 git init && push
+# 导致全线失守，预先建立本文件。
+# ============================================================
+
+# —— 备份与敏感数据（含全部 API key、bcrypt hash、data.key）——
+backup-remote/
+
+# —— 生产配置 ——
+cli-config.yaml
+**/cli-config.yaml
+config.yaml
+compose.yaml
+**/compose.yaml
+secrets/
+**/secrets/
+
+# —— 上游源码工作树（体积大，且各自是独立 git 仓库，另含源码归档 tar）——
+src/
+
+# —— 密钥类文件 ——
+*.key
+*.pem
+secrets
+secrets.*
+secrets*
+*cpa_management_key*
+*credential*
+
+# —— lrnev 治理记录（含密钥片段与内部信息）——
+.lrnev/
+
+# —— Python 后端虚拟环境 ——
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+
+# —— Node ——
+node_modules/
+**/node_modules/
+
+# —— 构建产物与通用 ——
+*.log
+*.tar.gz
+*.zip
+dist/
+build/
+.DS_Store
+.env
+.env.*
+!.env.example

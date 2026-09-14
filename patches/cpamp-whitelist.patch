@@ -1,0 +1,962 @@
+diff --git a/apps/web/src/components/config/ApiKeysCardEditor.tsx b/apps/web/src/components/config/ApiKeysCardEditor.tsx
+index 43dad11a..2d86678c 100644
+--- a/apps/web/src/components/config/ApiKeysCardEditor.tsx
++++ b/apps/web/src/components/config/ApiKeysCardEditor.tsx
+@@ -2,10 +2,12 @@ import { memo, useCallback, useEffect, useId, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Button } from '@/components/ui/Button';
+ import { Modal } from '@/components/ui/Modal';
++import { SelectionCheckbox } from '@/components/ui/SelectionCheckbox';
+ import {
+   usageServiceApi,
+   type ApiKeyAlias,
+ } from '@/services/api/usageService';
++import { apiClient } from '@/services/api/client';
+ import { useAuthStore, useNotificationStore } from '@/stores';
+ import { usePanelFeatureAvailability } from '@/hooks/usePanelFeatureAvailability';
+ import { copyToClipboard } from '@/utils/clipboard';
+@@ -22,12 +24,23 @@ type OrphanAliasConflict = {
+ 
+ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+   value,
++  modelsText,
+   disabled,
+   onChange,
++  onModelsChange,
++  onRequestCommit,
+ }: {
+   value: string;
++  modelsText?: string;
+   disabled?: boolean;
+   onChange: (nextValue: string) => void;
++  onModelsChange?: (nextValue: string) => void;
++  /**
++   * Ask the owning page to persist the pending visual changes right away, so
++   * that saving a key together with its model whitelist is a single click
++   * instead of requiring a second "save" on the configuration page header.
++   */
++  onRequestCommit?: () => void;
+ }) {
+   const { t } = useTranslation();
+   const showNotification = useNotificationStore((state) => state.showNotification);
+@@ -63,6 +76,14 @@ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+   const [inputValue, setInputValue] = useState('');
+   const [inputAliasValue, setInputAliasValue] = useState('');
+   const [formError, setFormError] = useState('');
++  const [inputModels, setInputModels] = useState<string[]>([]);
++  const [availableModels, setAvailableModels] = useState<string[]>([]);
++  const [modelsLoading, setModelsLoading] = useState(false);
++  const [modelsError, setModelsError] = useState('');
++  const [modelsSearch, setModelsSearch] = useState('');
++  // True when the candidate list came from the per-key /v1/models probe, which
++  // is filtered by that key's own whitelist, so the list may be incomplete.
++  const [modelsListPartial, setModelsListPartial] = useState(false);
+   const [apiKeyAliases, setApiKeyAliases] = useState<ApiKeyAlias[]>([]);
+   const [aliasesLoading, setAliasesLoading] = useState(false);
+   const [aliasesAvailable, setAliasesAvailable] = useState(false);
+@@ -126,12 +147,96 @@ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+     };
+   }, [managementKey, resolveAliasServiceBase]);
+ 
+-  function generateSecureApiKey(): string {
++  const generateSecureApiKey = useCallback((): string => {
+     const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+     const array = new Uint8Array(64);
+     crypto.getRandomValues(array);
+     return 'sk-' + Array.from(array, (b) => charset[b % charset.length]).join('');
+-  }
++  }, []);
++
++  // Load the model list used as whitelist candidates.
++  //
++  // Preferred source is GET /v0/management/models, which reads the registry
++  // directly and therefore always reports the *full* catalogue. CPAMP proxies
++  // any /v0/management/* path to CPA using the saved management key, so this
++  // needs no extra nginx routing.
++  //
++  // The previous implementation probed /v1/models with apiKeys[0]. That is
++  // wrong as soon as the first configured key happens to be a restricted one:
++  // CPA filters /v1/models per key, so the panel would only ever offer that
++  // key's own whitelist as candidates and an administrator could not grant any
++  // other model to the key being edited.
++  const loadAvailableModels = useCallback(async () => {
++    setModelsLoading(true);
++    setModelsError('');
++    setModelsListPartial(false);
++
++    const readManagementModels = async (): Promise<string[]> => {
++      const payload = await apiClient.get<{ data?: Array<{ id?: string }> }>('/models');
++      return Array.isArray(payload?.data)
++        ? payload.data.map((m) => String(m.id ?? '').trim()).filter(Boolean)
++        : [];
++    };
++
++    try {
++      const names = await readManagementModels();
++      if (names.length > 0) {
++        setAvailableModels(names);
++        setModelsLoading(false);
++        return;
++      }
++    } catch {
++      // Fall back to the client-key probe below.
++    }
++
++    // Fallback: CPA requires a *client* API key on /v1/models (the CPAMP
++    // admin/management key gets 401), so probe with the first configured key
++    // and, when adding the very first key, with the value being typed.
++    try {
++      const bearerKey = apiKeys[0] ?? inputValue.trim();
++      const authHeader = bearerKey ? { Authorization: `Bearer ${bearerKey}` } : undefined;
++      const response = await fetch('/v1/models', { headers: authHeader });
++      if (!response.ok) {
++        throw new Error(`HTTP ${response.status}`);
++      }
++      const payload = (await response.json()) as { data?: Array<{ id?: string }> };
++      const names = Array.isArray(payload?.data)
++        ? payload.data.map((m) => String(m.id ?? '').trim()).filter(Boolean)
++        : [];
++      setAvailableModels(names);
++      // This list is filtered by the probing key's own whitelist, so warn that
++      // it may not contain every model.
++      setModelsListPartial(true);
++    } catch (err: unknown) {
++      setAvailableModels([]);
++      setModelsError(t('config_management.visual.api_keys.models_fetch_error'));
++    } finally {
++      setModelsLoading(false);
++    }
++  }, [apiKeys, inputValue, t]);
++
++  const filteredModelOptions = useMemo(() => {
++    const filter = modelsSearch.trim().toLowerCase();
++    if (!filter) return availableModels;
++    return availableModels.filter((m) => m.toLowerCase().includes(filter));
++  }, [availableModels, modelsSearch]);
++
++  const toggleModelSelection = useCallback((model: string) => {
++    setInputModels((prev) => {
++      if (prev.includes(model)) return prev.filter((m) => m !== model);
++      return [...prev, model];
++    });
++  }, []);
++
++  const selectVisibleModels = useCallback(() => {
++    setInputModels((prev) => {
++      const next = new Set(prev);
++      filteredModelOptions.forEach((m) => next.add(m));
++      return Array.from(next);
++    });
++  }, [filteredModelOptions]);
++
++  const clearSelectedModels = useCallback(() => setInputModels([]), []);
+ 
+   const getApiKeyHash = (apiKey: string) => sha256Hex(apiKey).toLowerCase();
+ 
+@@ -314,16 +419,57 @@ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+     setEditingApiKeyId(null);
+     setInputValue('');
+     setInputAliasValue('');
++    setInputModels([]);
+     setFormError('');
+     setModalOpen(true);
+   };
+ 
++  // Build a map of key -> models from the modelsText lines ("key=model1,model2").
++  const modelsByKey = useMemo(() => {
++    const map = new Map<string, string[]>();
++    if (!modelsText) return map;
++    for (const line of modelsText.split('\n')) {
++      const trimmed = line.trim();
++      if (!trimmed) continue;
++      const eqIndex = trimmed.indexOf('=');
++      if (eqIndex <= 0) continue;
++      const keyName = trimmed.slice(0, eqIndex).trim();
++      const models = trimmed
++        .slice(eqIndex + 1)
++        .split(',')
++        .map((m) => m.trim())
++        .filter((m) => m.length > 0);
++      if (keyName) map.set(keyName, models);
++    }
++    return map;
++  }, [modelsText]);
++
++  const updateModelsForKeys = useCallback(
++    (entries: Array<{ key: string; models: string[] }>) => {
++      const next = new Map(modelsByKey);
++      for (const { key, models } of entries) {
++        if (models.length > 0) {
++          next.set(key, models);
++        } else {
++          next.delete(key);
++        }
++      }
++      const lines: string[] = [];
++      for (const [keyName, modelList] of next) {
++        lines.push(`${keyName}=${modelList.join(',')}`);
++      }
++      onModelsChange?.(lines.join('\n'));
++    },
++    [modelsByKey, onModelsChange]
++  );
++
+   const openEditModal = (apiKeyId: string) => {
+     const editingIndex = renderApiKeyIds.findIndex((id) => id === apiKeyId);
+     const editingKey = apiKeys[editingIndex] ?? '';
+     setEditingApiKeyId(apiKeyId);
+     setInputValue(editingKey);
+     setInputAliasValue(getAliasForApiKey(editingKey));
++    setInputModels(modelsByKey.get(editingKey) ?? []);
+     setFormError('');
+     setModalOpen(true);
+   };
+@@ -332,8 +478,10 @@ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+     setModalOpen(false);
+     setInputValue('');
+     setInputAliasValue('');
++    setInputModels([]);
+     setEditingApiKeyId(null);
+     setFormError('');
++    setModelsSearch('');
+   };
+ 
+   const openAliasModal = (apiKeyId: string) => {
+@@ -359,8 +507,33 @@ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+   const handleDelete = (apiKeyId: string) => {
+     const index = renderApiKeyIds.findIndex((id) => id === apiKeyId);
+     if (index < 0) return;
+-    setApiKeyIds(renderApiKeyIds.filter((id) => id !== apiKeyId));
+-    updateApiKeys(apiKeys.filter((_, i) => i !== index));
++    const removedKey = apiKeys[index];
++    const commitDelete = () => {
++      setApiKeyIds(renderApiKeyIds.filter((id) => id !== apiKeyId));
++      updateApiKeys(apiKeys.filter((_, i) => i !== index));
++      if (removedKey && modelsByKey.has(removedKey)) {
++        updateModelsForKeys([{ key: removedKey, models: [] }]);
++      }
++      // Keep delete consistent with add/edit: without this the row disappears
++      // from the list while the key stays live in config.yaml until a second
++      // save, so the panel and the gateway disagree about who can connect.
++      onRequestCommit?.();
++    };
++    // Deletion now lands in config.yaml straight away, so it needs an explicit
++    // confirmation. Removing the final key additionally leaves the gateway with
++    // no api-keys at all, which is called out separately.
++    showConfirmation({
++      title: t('config_management.visual.api_keys.delete_title'),
++      message:
++        apiKeys.length <= 1
++          ? t('config_management.visual.api_keys.delete_last_confirm')
++          : t('config_management.visual.api_keys.delete_confirm'),
++      confirmText: t('config_management.visual.api_keys.delete_confirm_action'),
++      variant: 'danger',
++      onConfirm: async () => {
++        commitDelete();
++      },
++    });
+   };
+ 
+   const handleSave = async () => {
+@@ -426,7 +599,26 @@ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+       setApiKeyIds([...renderApiKeyIds, makeClientId()]);
+     }
+     updateApiKeys(nextKeys);
++    // Persist the model whitelist for the saved key. When renaming an existing
++    // key, also drop the whitelist entry belonging to the previous key string so
++    // stale entries do not linger in api-key-models.
++    const removedEntries: Array<{ key: string; models: string[] }> = [];
++    if (editingApiKeyId !== null) {
++      const editingIndex = renderApiKeyIds.findIndex((id) => id === editingApiKeyId);
++      const previousKey = apiKeys[editingIndex];
++      if (previousKey && previousKey !== trimmed && modelsByKey.has(previousKey)) {
++        removedEntries.push({ key: previousKey, models: [] });
++      }
++    }
++    updateModelsForKeys([
++      { key: trimmed, models: inputModels },
++      ...removedEntries,
++    ]);
+     closeModal();
++    // Persist api-keys and api-key-models in one step: the state updates above
++    // are batched, so the owning page performs the write from an effect once
++    // the new values have been committed.
++    onRequestCommit?.();
+   };
+ 
+   const handleAliasSave = async () => {
+@@ -642,6 +834,95 @@ export const ApiKeysCardEditor = memo(function ApiKeysCardEditor({
+             />
+             <div className="hint">{t('config_management.visual.api_keys.alias_hint')}</div>
+           </div>
++
++          <div className="form-group">
++            <label>{t('config_management.visual.api_keys.models_label')}</label>
++            <div className="hint">{t('config_management.visual.api_keys.models_hint')}</div>
++            <div style={{ display: 'flex', gap: '0.5rem', margin: '0.5rem 0' }}>
++              <Button
++                type="button"
++                variant="secondary"
++                size="sm"
++                onClick={() => void loadAvailableModels()}
++                disabled={disabled || modelsLoading}
++              >
++                {modelsLoading
++                  ? t('config_management.visual.api_keys.models_fetch_loading')
++                  : t('config_management.visual.api_keys.models_load_button')}
++              </Button>
++              <Button
++                type="button"
++                variant="secondary"
++                size="sm"
++                onClick={selectVisibleModels}
++                disabled={disabled || filteredModelOptions.length === 0}
++              >
++                {t('config_management.visual.api_keys.models_select_visible')}
++              </Button>
++              <Button
++                type="button"
++                variant="secondary"
++                size="sm"
++                onClick={clearSelectedModels}
++                disabled={disabled || inputModels.length === 0}
++              >
++                {t('config_management.visual.api_keys.models_clear_selection')}
++              </Button>
++            </div>
++            <input
++              className="input"
++              placeholder={t('config_management.visual.api_keys.models_search_placeholder')}
++              value={modelsSearch}
++              onChange={(e) => setModelsSearch(e.target.value)}
++              disabled={disabled}
++            />
++            <div className="hint">
++              {t('config_management.visual.api_keys.models_selected_count', {
++                count: inputModels.length,
++              })}
++            </div>
++            {modelsError && <div className="error-box">{modelsError}</div>}
++            {modelsListPartial && !modelsError && (
++              <div className="hint" role="status">
++                {t('config_management.visual.api_keys.models_list_partial_hint')}
++              </div>
++            )}
++            <div
++              style={{
++                maxHeight: '220px',
++                overflowY: 'auto',
++                border: '1px solid var(--border-color, #e2e8f0)',
++                borderRadius: '6px',
++                padding: '0.5rem',
++                marginTop: '0.5rem',
++              }}
++            >
++              {filteredModelOptions.length === 0 ? (
++                <div className="hint">
++                  {modelsLoading
++                    ? t('config_management.visual.api_keys.models_fetch_loading')
++                    : t('config_management.visual.api_keys.models_fetch_empty')}
++                </div>
++              ) : (
++                filteredModelOptions.map((model) => (
++                  <div
++                    key={model}
++                    style={{
++                      padding: '0.25rem 0',
++                    }}
++                  >
++                    <SelectionCheckbox
++                      checked={inputModels.includes(model)}
++                      onChange={() => toggleModelSelection(model)}
++                      label={model}
++                      disabled={disabled}
++                    />
++                  </div>
++                ))
++              )}
++            </div>
++          </div>
++
+           {formError && (
+             <div id={apiKeyErrorId} className="error-box">
+               {formError}
+diff --git a/apps/web/src/components/config/VisualConfigEditor.tsx b/apps/web/src/components/config/VisualConfigEditor.tsx
+index ab4dddb9..bb4e8ba8 100644
+--- a/apps/web/src/components/config/VisualConfigEditor.tsx
++++ b/apps/web/src/components/config/VisualConfigEditor.tsx
+@@ -71,6 +71,11 @@ interface VisualConfigEditorProps {
+   hasPayloadValidationErrors?: boolean;
+   disabled?: boolean;
+   onChange: (values: Partial<VisualConfigValues>) => void;
++  /**
++   * Persist pending visual changes immediately. Passed down to the API key
++   * editor so saving a key plus its model whitelist needs one click only.
++   */
++  onRequestCommit?: () => void;
+ }
+ 
+ function getValidationMessage(
+@@ -178,6 +183,7 @@ export function VisualConfigEditor({
+   hasPayloadValidationErrors = false,
+   disabled = false,
+   onChange,
++  onRequestCommit,
+ }: VisualConfigEditorProps) {
+   const { t } = useTranslation();
+   const pageTransitionLayer = usePageTransitionLayer();
+@@ -246,6 +252,10 @@ export function VisualConfigEditor({
+     (apiKeysText: string) => onChange({ apiKeysText }),
+     [onChange]
+   );
++  const handleApiKeyModelsTextChange = useCallback(
++    (apiKeyModelsText: string) => onChange({ apiKeyModelsText }),
++    [onChange]
++  );
+   const handlePayloadDefaultRulesChange = useCallback(
+     (payloadDefaultRules: PayloadRule[]) => onChange({ payloadDefaultRules }),
+     [onChange]
+@@ -771,8 +781,11 @@ export function VisualConfigEditor({
+               <div className={styles.subsection}>
+                 <ApiKeysCardEditor
+                   value={values.apiKeysText}
++                  modelsText={values.apiKeyModelsText}
+                   disabled={disabled}
+                   onChange={handleApiKeysTextChange}
++                  onModelsChange={handleApiKeyModelsTextChange}
++                  onRequestCommit={onRequestCommit}
+                 />
+               </div>
+             </SectionStack>
+diff --git a/apps/web/src/features/config/ConfigPage.tsx b/apps/web/src/features/config/ConfigPage.tsx
+index b455829a..b3433588 100644
+--- a/apps/web/src/features/config/ConfigPage.tsx
++++ b/apps/web/src/features/config/ConfigPage.tsx
+@@ -1,6 +1,7 @@
+ import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { createPortal } from 'react-dom';
++import { useBlocker } from 'react-router-dom';
+ import type { ReactCodeMirrorRef } from '@uiw/react-codemirror';
+ import { parse as parseYaml, parseDocument } from 'yaml';
+ import { usePageTransitionLayer } from '@/components/common/PageTransitionLayer';
+@@ -273,6 +274,10 @@ export function ConfigPage() {
+   const [error, setError] = useState('');
+   const [dirty, setDirty] = useState(false);
+   const [diffModalOpen, setDiffModalOpen] = useState(false);
++  // Set by the API key editor so a key plus its model whitelist can be written
++  // to config.yaml with a single click, without the diff confirmation round-trip.
++  const [pendingVisualCommit, setPendingVisualCommit] = useState(false);
++  const visualCommitInFlightRef = useRef(false);
+   const [serverYaml, setServerYaml] = useState('');
+   const [mergedYaml, setMergedYaml] = useState('');
+   const [previewServerYaml, setPreviewServerYaml] = useState('');
+@@ -458,6 +463,36 @@ export function ConfigPage() {
+   const managerCanSave = managerSaveState.canSave;
+   const isDirty = isManagerTab ? managerHasPendingSave : sourceDirty;
+ 
++  // Block navigating away (route change / hash change) while there are unsaved
++  // changes so edits are not silently discarded, e.g. after editing API keys
++  // in the visual editor and switching to another page.
++  const unsavedBlocker = useBlocker(
++    useCallback(() => isDirty, [isDirty])
++  );
++
++  useEffect(() => {
++    if (!unsavedBlocker || unsavedBlocker.state !== 'blocked') return;
++    showConfirmation({
++      title: t('common.unsaved_changes_title'),
++      message: t('config_management.unsaved_changes_leave_message'),
++      confirmText: t('config_management.unsaved_changes_leave_confirm'),
++      cancelText: t('common.cancel'),
++      variant: 'danger',
++      onConfirm: () => unsavedBlocker.proceed(),
++      onCancel: () => unsavedBlocker.reset(),
++    });
++  }, [unsavedBlocker, showConfirmation, t]);
++
++  useEffect(() => {
++    if (!isDirty) return;
++    const onBeforeUnload = (event: BeforeUnloadEvent) => {
++      event.preventDefault();
++      event.returnValue = '';
++    };
++    window.addEventListener('beforeunload', onBeforeUnload);
++    return () => window.removeEventListener('beforeunload', onBeforeUnload);
++  }, [isDirty]);
++
+   const syncEmbeddedManagerBootstrap = useCallback(
+     (serviceBase: string) => {
+       if (panelHostedByUsageService !== true) return;
+@@ -866,6 +901,73 @@ export function ConfigPage() {
+     }
+   };
+ 
++  /**
++   * Write the current visual state straight back to config.yaml.
++   *
++   * handleSave() intentionally stops at the diff preview so an operator can
++   * review a full configuration change. For the API key editor that extra step
++   * meant a second save on the page header before a new key or whitelist took
++   * effect, so this variant persists immediately and then re-reads the server
++   * copy to reset the dirty baseline.
++   */
++  const commitVisualChangesNow = useCallback(async () => {
++    if (visualCommitInFlightRef.current) return;
++    visualCommitInFlightRef.current = true;
++    setSaving(true);
++    try {
++      const latestServerYaml = await configFileApi.fetchConfigYaml();
++      const visualBaseYaml = dirty ? content : latestServerYaml;
++      const nextMergedYaml = applyVisualChangesToYaml(visualBaseYaml);
++
++      if (nextMergedYaml === latestServerYaml) {
++        setDirty(false);
++        setContent(latestServerYaml);
++        setServerYaml(latestServerYaml);
++        setMergedYaml(nextMergedYaml);
++        setPreviewServerYaml(latestServerYaml);
++        loadVisualValuesFromYaml(latestServerYaml);
++        return;
++      }
++
++      await configFileApi.saveConfigYaml(nextMergedYaml);
++      const latestContent = await configFileApi.fetchConfigYaml();
++      setDirty(false);
++      setContent(latestContent);
++      setServerYaml(latestContent);
++      setMergedYaml(latestContent);
++      setPreviewServerYaml(latestContent);
++      loadVisualValuesFromYaml(latestContent);
++
++      // Keep the global config store in sync so the sidebar reflects the change.
++      try {
++        useConfigStore.getState().clearCache();
++        await useConfigStore.getState().fetchConfig(undefined, true);
++      } catch {
++        // A failed cache refresh must not report the save itself as failed.
++      }
++      showNotification(t('config_management.saved_immediately'), 'success');
++    } catch (err: unknown) {
++      const message = err instanceof Error ? err.message : '';
++      showNotification(`${t('notification.save_failed')}: ${message}`, 'error');
++    } finally {
++      visualCommitInFlightRef.current = false;
++      setSaving(false);
++    }
++  }, [
++    applyVisualChangesToYaml,
++    content,
++    dirty,
++    loadVisualValuesFromYaml,
++    showNotification,
++    t,
++  ]);
++
++  useEffect(() => {
++    if (!pendingVisualCommit) return;
++    setPendingVisualCommit(false);
++    void commitVisualChangesNow();
++  }, [pendingVisualCommit, commitVisualChangesNow]);
++
+   const handleChange = useCallback((value: string) => {
+     setContent(value);
+     setDirty(true);
+@@ -1318,6 +1420,7 @@ export function ConfigPage() {
+               hasPayloadValidationErrors={visualHasPayloadValidationErrors}
+               disabled={disableControls || loading}
+               onChange={setVisualValues}
++              onRequestCommit={() => setPendingVisualCommit(true)}
+             />
+           ) : (
+             <div className={styles.sourceWorkspace}>
+diff --git a/apps/web/src/hooks/useVisualConfig.ts b/apps/web/src/hooks/useVisualConfig.ts
+index 23214bb6..5fa4a6d2 100644
+--- a/apps/web/src/hooks/useVisualConfig.ts
++++ b/apps/web/src/hooks/useVisualConfig.ts
+@@ -64,6 +64,24 @@ function parseApiKeysText(raw: unknown): string {
+   return keys.join('\n');
+ }
+ 
++// parseApiKeyModelsText converts the api-key-models mapping
++// ({ "sk-key": ["model-a", "model-b"] }) into lines of the form
++// "sk-key=model-a,model-b".
++function parseApiKeyModelsText(raw: unknown): string {
++  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return '';
++  const lines: string[] = [];
++  for (const [key, models] of Object.entries(raw)) {
++    if (!key) continue;
++    if (!Array.isArray(models)) continue;
++    const modelNames = models
++      .map((m) => String(m ?? '').trim())
++      .filter((m) => m.length > 0);
++    if (modelNames.length === 0) continue;
++    lines.push(`${key}=${modelNames.join(',')}`);
++  }
++  return lines.join('\n');
++}
++
+ function parseStringArrayText(raw: unknown): string {
+   if (!Array.isArray(raw)) return '';
+   return raw
+@@ -517,6 +535,9 @@ function getNextDirtyFields(
+   if (Object.prototype.hasOwnProperty.call(patch, 'apiKeysText')) {
+     updateDirty('apiKeysText', nextValues.apiKeysText === baselineValues.apiKeysText);
+   }
++  if (Object.prototype.hasOwnProperty.call(patch, 'apiKeyModelsText')) {
++    updateDirty('apiKeyModelsText', nextValues.apiKeyModelsText === baselineValues.apiKeyModelsText);
++  }
+   if (Object.prototype.hasOwnProperty.call(patch, 'debug')) {
+     updateDirty('debug', nextValues.debug === baselineValues.debug);
+   }
+@@ -775,6 +796,7 @@ export function useVisualConfig() {
+ 
+         authDir: typeof parsed['auth-dir'] === 'string' ? parsed['auth-dir'] : '',
+         apiKeysText: resolveApiKeysText(parsed),
++        apiKeyModelsText: parseApiKeyModelsText(parsed['api-key-models']),
+         pluginsEnabled: Boolean(plugins?.enabled),
+         pluginsDir: typeof plugins?.dir === 'string' ? plugins.dir : '',
+         pluginStoreSourcesText: parseStringArrayText(
+@@ -981,6 +1003,31 @@ export function useVisualConfig() {
+           deleteLegacyApiKeysProvider(doc);
+         }
+ 
++        if (isDirty('apiKeyModelsText')) {
++          const keyModels: Record<string, string[]> = {};
++          for (const line of values.apiKeyModelsText.split('\n')) {
++            const trimmedLine = line.trim();
++            if (!trimmedLine) continue;
++            const eqIndex = trimmedLine.indexOf('=');
++            if (eqIndex <= 0) continue;
++            const keyName = trimmedLine.slice(0, eqIndex).trim();
++            const models = trimmedLine
++              .slice(eqIndex + 1)
++              .split(',')
++              .map((m) => m.trim())
++              .filter((m) => m.length > 0);
++            if (!keyName) continue;
++            if (models.length > 0) {
++              keyModels[keyName] = models;
++            }
++          }
++          if (Object.keys(keyModels).length > 0) {
++            doc.setIn(['api-key-models'], keyModels);
++          } else if (docHas(doc, ['api-key-models'])) {
++            doc.deleteIn(['api-key-models']);
++          }
++        }
++
+         if (isDirty('debug')) setBooleanInDoc(doc, ['debug'], values.debug);
+ 
+         const shouldWritePprofEnable = isDirty('pprofEnable');
+diff --git a/apps/web/src/hooks/useVisualConfigApiKeyWhitelist.test.ts b/apps/web/src/hooks/useVisualConfigApiKeyWhitelist.test.ts
+new file mode 100644
+index 00000000..bb62f13e
+--- /dev/null
++++ b/apps/web/src/hooks/useVisualConfigApiKeyWhitelist.test.ts
+@@ -0,0 +1,171 @@
++import { act, createElement, createRef, useImperativeHandle, type Ref } from 'react';
++import { create, type ReactTestRenderer } from 'react-test-renderer';
++import { describe, expect, it } from 'vitest';
++import { parse as parseYaml } from 'yaml';
++import { useVisualConfig } from './useVisualConfig';
++
++type UseVisualConfigResult = ReturnType<typeof useVisualConfig>;
++
++type UseVisualConfigHarness = {
++  getCurrent: () => UseVisualConfigResult;
++  unmount: () => void;
++};
++
++function HookHarness({ hookRef }: { hookRef: Ref<UseVisualConfigResult> }) {
++  const hook = useVisualConfig();
++  useImperativeHandle(hookRef, () => hook, [hook]);
++  return null;
++}
++
++const mountUseVisualConfig = (): UseVisualConfigHarness => {
++  const hookRef = createRef<UseVisualConfigResult>();
++  let renderer: ReactTestRenderer | null = null;
++
++  act(() => {
++    renderer = create(createElement(HookHarness, { hookRef }));
++  });
++
++  return {
++    getCurrent: () => {
++      if (!hookRef.current) {
++        throw new Error('Failed to mount useVisualConfig test harness');
++      }
++      return hookRef.current;
++    },
++    unmount: () => {
++      if (!renderer) return;
++      act(() => {
++        renderer?.unmount();
++      });
++    },
++  };
++};
++
++const RESTRICTED = 'sk-restricted-key';
++const FREE = 'sk-free-key';
++
++const baseYaml = [
++  'port: 8317',
++  'api-keys:',
++  `  - ${FREE}`,
++  `  - ${RESTRICTED}`,
++  'api-key-models:',
++  `  ${RESTRICTED}:`,
++  '    - hublinuxdo/deepseek-v4-flash',
++  '    - 天机阁/gpt-5.4',
++  '',
++].join('\n');
++
++type CpaConfig = {
++  port?: number;
++  'api-keys'?: string[];
++  'api-key-models'?: Record<string, string[]>;
++};
++
++describe('useVisualConfig per-key model whitelist', () => {
++  it('parses api-key-models into key=model1,model2 lines', () => {
++    const harness = mountUseVisualConfig();
++    act(() => {
++      expect(harness.getCurrent().loadVisualValuesFromYaml(baseYaml).ok).toBe(true);
++    });
++
++    const values = harness.getCurrent().visualValues;
++    expect(values.apiKeysText.split('\n').map((line: string) => line.trim())).toEqual([
++      FREE,
++      RESTRICTED,
++    ]);
++    expect(values.apiKeyModelsText).toBe(
++      `${RESTRICTED}=hublinuxdo/deepseek-v4-flash,天机阁/gpt-5.4`
++    );
++    harness.unmount();
++  });
++
++  // F-04: a single visual write must carry both the key list and the whitelist,
++  // which is what lets the API key dialog save without a second page-level save.
++  it('writes api-keys and api-key-models together in one apply pass', () => {
++    const harness = mountUseVisualConfig();
++    act(() => {
++      expect(harness.getCurrent().loadVisualValuesFromYaml(baseYaml).ok).toBe(true);
++      harness.getCurrent().setVisualValues({
++        apiKeysText: [FREE, RESTRICTED, 'sk-brand-new-key'].join('\n'),
++        apiKeyModelsText: [
++          `${RESTRICTED}=hublinuxdo/deepseek-v4-flash,天机阁/gpt-5.4`,
++          'sk-brand-new-key=魔芋/deepseek-v4-pro-0813',
++        ].join('\n'),
++      });
++    });
++
++    const nextYaml = harness.getCurrent().applyVisualChangesToYaml(baseYaml);
++    const parsed = parseYaml(nextYaml) as CpaConfig;
++
++    expect(parsed.port).toBe(8317);
++    expect(parsed['api-keys']).toEqual([FREE, RESTRICTED, 'sk-brand-new-key']);
++    expect(parsed['api-key-models']).toEqual({
++      [RESTRICTED]: ['hublinuxdo/deepseek-v4-flash', '天机阁/gpt-5.4'],
++      'sk-brand-new-key': ['魔芋/deepseek-v4-pro-0813'],
++    });
++    harness.unmount();
++  });
++
++  it('round-trips a freshly written whitelist back into the editor text', () => {
++    const harness = mountUseVisualConfig();
++    act(() => {
++      expect(harness.getCurrent().loadVisualValuesFromYaml(baseYaml).ok).toBe(true);
++      harness.getCurrent().setVisualValues({
++        apiKeyModelsText: `${RESTRICTED}=a/one,b/two`,
++      });
++    });
++    const nextYaml = harness.getCurrent().applyVisualChangesToYaml(baseYaml);
++
++    const readBack = mountUseVisualConfig();
++    act(() => {
++      expect(readBack.getCurrent().loadVisualValuesFromYaml(nextYaml).ok).toBe(true);
++    });
++    expect(readBack.getCurrent().visualValues.apiKeyModelsText).toBe(
++      `${RESTRICTED}=a/one,b/two`
++    );
++    harness.unmount();
++    readBack.unmount();
++  });
++
++  // Dropping every model for the last key must remove api-key-models entirely
++  // so CPA treats the key as unrestricted rather than as allowed-nothing.
++  it('deletes api-key-models when the whitelist becomes empty but keeps api-keys', () => {
++    const harness = mountUseVisualConfig();
++    act(() => {
++      expect(harness.getCurrent().loadVisualValuesFromYaml(baseYaml).ok).toBe(true);
++      harness.getCurrent().setVisualValues({ apiKeyModelsText: '' });
++    });
++
++    const parsed = parseYaml(
++      harness.getCurrent().applyVisualChangesToYaml(baseYaml)
++    ) as CpaConfig;
++
++    expect(parsed['api-key-models']).toBeUndefined();
++    expect(parsed['api-keys']).toEqual([FREE, RESTRICTED]);
++    harness.unmount();
++  });
++
++  it('ignores malformed whitelist lines instead of writing partial entries', () => {
++    const harness = mountUseVisualConfig();
++    act(() => {
++      expect(harness.getCurrent().loadVisualValuesFromYaml(baseYaml).ok).toBe(true);
++      harness.getCurrent().setVisualValues({
++        apiKeyModelsText: [
++          'no-equals-sign',
++          `=orphan-models`,
++          `${RESTRICTED}=  , valid/model `,
++        ].join('\n'),
++      });
++    });
++
++    const parsed = parseYaml(
++      harness.getCurrent().applyVisualChangesToYaml(baseYaml)
++    ) as CpaConfig;
++
++    expect(parsed['api-key-models']).toEqual({
++      [RESTRICTED]: ['valid/model'],
++    });
++    harness.unmount();
++  });
++});
+diff --git a/apps/web/src/i18n/locales/en.json b/apps/web/src/i18n/locales/en.json
+index 3b581323..ae085710 100644
+--- a/apps/web/src/i18n/locales/en.json
++++ b/apps/web/src/i18n/locales/en.json
+@@ -3236,6 +3236,9 @@
+     "editor_title": "Configuration File",
+     "reload": "Reload",
+     "reload_confirm_message": "Reloading will discard your unsaved changes. Do you want to continue?",
++    "unsaved_changes_leave_message": "You have unsaved changes. Leaving this page will discard them. Do you want to leave without saving?",
++    "unsaved_changes_leave_confirm": "Leave without saving",
++    "saved_immediately": "Configuration saved and applied",
+     "save": "Save",
+     "description": "Edit config.yaml via visual editor or source file",
+     "status_idle": "Waiting for action",
+@@ -3584,7 +3587,22 @@
+         "alias_error_too_long": "Alias must be 120 characters or less",
+         "alias_error_duplicate": "Alias already exists. Use a unique alias.",
+         "error_empty": "Please enter an API key",
+-        "error_invalid": "API key contains invalid characters"
++        "error_invalid": "API key contains invalid characters",
++        "models_label": "Model whitelist (optional)",
++        "models_hint": "When selected, this API key can only access the chosen models; leave empty to allow all.",
++        "models_search_placeholder": "Search models...",
++        "models_fetch_loading": "Loading models...",
++        "models_fetch_empty": "No models found. Make sure CPA has channels configured.",
++        "models_fetch_error": "Failed to load models",
++        "models_select_visible": "Select visible",
++        "models_clear_selection": "Clear selection",
++        "models_selected_count": "{{count}} selected",
++        "models_load_button": "Load models",
++        "models_list_partial_hint": "Showing the list reported by an API key, so it may be incomplete. Configure the management endpoint on CPA v7.2.145 or newer to always list every model.",
++        "delete_title": "Delete API key",
++        "delete_confirm": "This removes the key from config.yaml immediately and it stops working right away. Continue?",
++        "delete_last_confirm": "This is the only API key. Deleting it leaves the gateway with no api-keys, so every request will be rejected. Continue?",
++        "delete_confirm_action": "Delete now"
+       },
+       "payload_rules": {
+         "rule": "Rule",
+diff --git a/apps/web/src/i18n/locales/zh-CN.json b/apps/web/src/i18n/locales/zh-CN.json
+index db1e4a61..c8a70364 100644
+--- a/apps/web/src/i18n/locales/zh-CN.json
++++ b/apps/web/src/i18n/locales/zh-CN.json
+@@ -3234,6 +3234,9 @@
+     "editor_title": "配置文件",
+     "reload": "重新加载",
+     "reload_confirm_message": "重新加载将丢弃你当前未保存的修改，确定继续吗？",
++    "unsaved_changes_leave_message": "当前页面有未保存的修改，离开页面前不会自动保存，确定不保存就离开吗？",
++    "unsaved_changes_leave_confirm": "不保存并离开",
++    "saved_immediately": "配置已保存并生效",
+     "save": "保存",
+     "description": "通过可视化或者源文件方式编辑 config.yaml 配置文件",
+     "status_idle": "等待操作",
+@@ -3582,7 +3585,22 @@
+         "alias_error_too_long": "别名不能超过 120 个字符",
+         "alias_error_duplicate": "别名已存在，请换一个唯一别名",
+         "error_empty": "请输入 API 密钥",
+-        "error_invalid": "API 密钥包含无效字符"
++        "error_invalid": "API 密钥包含无效字符",
++        "models_label": "模型白名单（可选）",
++        "models_hint": "勾选后该 API 密钥只能访问选中的模型；不勾选则访问全部模型。",
++        "models_search_placeholder": "搜索模型...",
++        "models_fetch_loading": "正在加载模型列表...",
++        "models_fetch_empty": "未获取到模型，请确认 CPA 已配置渠道",
++        "models_fetch_error": "获取模型失败",
++        "models_select_visible": "全选当前列表",
++        "models_clear_selection": "清空已选",
++        "models_selected_count": "已选 {{count}} 项",
++        "models_load_button": "加载模型",
++        "models_list_partial_hint": "当前列表来自某个 API Key，可能不完整。为 CPA 升级到 v7.2.145 及以上并启用管理端模型接口后，这里会始终列出全部模型。",
++        "delete_title": "删除 API 密钥",
++        "delete_confirm": "这会立即从 config.yaml 中移除该密钥并马上生效，密钥将立刻不可用。确定继续？",
++        "delete_last_confirm": "这是最后一个 API 密钥。删除后网关将没有任何 api-keys，所有请求都会被拒绝。确定继续？",
++        "delete_confirm_action": "立即删除"
+       },
+       "payload_rules": {
+         "rule": "规则",
+diff --git a/apps/web/src/i18n/locales/zh-TW.json b/apps/web/src/i18n/locales/zh-TW.json
+index 2d2b4468..aea16f4c 100644
+--- a/apps/web/src/i18n/locales/zh-TW.json
++++ b/apps/web/src/i18n/locales/zh-TW.json
+@@ -3234,6 +3234,9 @@
+     "editor_title": "設定檔",
+     "reload": "重新載入",
+     "reload_confirm_message": "重新載入將捨棄你目前未儲存的修改，確定繼續嗎？",
++    "unsaved_changes_leave_message": "目前頁面有未儲存的修改，離開前不會自動儲存，確定不儲存就離開嗎？",
++    "unsaved_changes_leave_confirm": "不儲存並離開",
++    "saved_immediately": "配置已儲存並生效",
+     "save": "儲存",
+     "description": "透過視覺化或原始檔方式編輯 config.yaml 設定檔",
+     "status_idle": "等待操作",
+@@ -3582,7 +3585,22 @@
+         "alias_error_too_long": "別名不能超過 120 個字元",
+         "alias_error_duplicate": "別名已存在，請換一個唯一別名",
+         "error_empty": "請輸入 API 金鑰",
+-        "error_invalid": "API 金鑰包含無效字元"
++        "error_invalid": "API 金鑰包含無效字元",
++        "models_label": "模型白名單（選填）",
++        "models_hint": "勾選後該 API 金鑰只能存取選取的模型；不勾選則存取全部模型。",
++        "models_search_placeholder": "搜尋模型...",
++        "models_fetch_loading": "正在載入模型清單...",
++        "models_fetch_empty": "未取得模型，請確認 CPA 已配置管道",
++        "models_fetch_error": "取得模型失敗",
++        "models_select_visible": "全選目前清單",
++        "models_clear_selection": "清空已選",
++        "models_selected_count": "已選 {{count}} 項",
++        "models_load_button": "載入模型",
++        "models_list_partial_hint": "目前清單來自某個 API 金鑰，可能不完整。將 CPA 升級至 v7.2.145 及以上並啟用管理端模型介面後，這裡會始終列出全部模型。",
++        "delete_title": "刪除 API 金鑰",
++        "delete_confirm": "這會立即從 config.yaml 中移除該金鑰並馬上生效，金鑰將立刻不可用。確定繼續？",
++        "delete_last_confirm": "這是最後一個 API 金鑰。刪除後閘道將沒有任何 api-keys，所有請求都會被拒絕。確定繼續？",
++        "delete_confirm_action": "立即刪除"
+       },
+       "payload_rules": {
+         "rule": "規則",
+diff --git a/apps/web/src/types/visualConfig.ts b/apps/web/src/types/visualConfig.ts
+index 5c008255..bb847f5a 100644
+--- a/apps/web/src/types/visualConfig.ts
++++ b/apps/web/src/types/visualConfig.ts
+@@ -103,6 +103,7 @@ export type VisualConfigValues = {
+   rmPanelRepo: string;
+   authDir: string;
+   apiKeysText: string;
++  apiKeyModelsText: string;
+   pluginsEnabled: boolean;
+   pluginsDir: string;
+   pluginStoreSourcesText: string;
+@@ -178,6 +179,7 @@ export const DEFAULT_VISUAL_VALUES: VisualConfigValues = {
+   rmPanelRepo: '',
+   authDir: '',
+   apiKeysText: '',
++  apiKeyModelsText: '',
+   pluginsEnabled: false,
+   pluginsDir: '',
+   pluginStoreSourcesText: '',

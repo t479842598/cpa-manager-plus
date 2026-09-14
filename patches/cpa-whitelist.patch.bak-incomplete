@@ -1,0 +1,328 @@
+diff --git a/internal/access/config_access/provider.go b/internal/access/config_access/provider.go
+index 915160b..36be6a1 100644
+--- a/internal/access/config_access/provider.go
++++ b/internal/access/config_access/provider.go
+@@ -24,16 +24,17 @@ func Register(cfg *sdkconfig.SDKConfig) {
+ 
+ 	sdkaccess.RegisterProvider(
+ 		sdkaccess.AccessProviderTypeConfigAPIKey,
+-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
++		newProvider(sdkaccess.DefaultAccessProviderName, keys, cfg.APIKeyModels),
+ 	)
+ }
+ 
+ type provider struct {
+-	name string
+-	keys map[string]struct{}
++	name     string
++	keys     map[string]struct{}
++	keyModel map[string][]string
+ }
+ 
+-func newProvider(name string, keys []string) *provider {
++func newProvider(name string, keys []string, keyModel map[string][]string) *provider {
+ 	providerName := strings.TrimSpace(name)
+ 	if providerName == "" {
+ 		providerName = sdkaccess.DefaultAccessProviderName
+@@ -42,7 +43,11 @@ func newProvider(name string, keys []string) *provider {
+ 	for _, key := range keys {
+ 		keySet[key] = struct{}{}
+ 	}
+-	return &provider{name: providerName, keys: keySet}
++	normalizedKeyModel := make(map[string][]string, len(keyModel))
++	for k, models := range keyModel {
++		normalizedKeyModel[k] = normalizeModelList(models)
++	}
++	return &provider{name: providerName, keys: keySet, keyModel: normalizedKeyModel}
+ }
+ 
+ func (p *provider) Identifier() string {
+@@ -90,12 +95,16 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
+ 			continue
+ 		}
+ 		if _, ok := p.keys[candidate.value]; ok {
++			metadata := map[string]string{
++				"source": candidate.source,
++			}
++			if models := p.keyModel[candidate.value]; len(models) > 0 {
++				metadata["model-whitelist"] = strings.Join(models, ",")
++			}
+ 			return &sdkaccess.Result{
+ 				Provider:  p.Identifier(),
+ 				Principal: candidate.value,
+-				Metadata: map[string]string{
+-					"source": candidate.source,
+-				},
++				Metadata:  metadata,
+ 			}, nil
+ 		}
+ 	}
+@@ -139,3 +148,24 @@ func normalizeKeys(keys []string) []string {
+ 	}
+ 	return normalized
+ }
++
++// normalizeModelList trims, dedupes and drops blank model names.
++func normalizeModelList(models []string) []string {
++	if len(models) == 0 {
++		return nil
++	}
++	out := make([]string, 0, len(models))
++	seen := make(map[string]struct{}, len(models))
++	for _, m := range models {
++		m = strings.TrimSpace(m)
++		if m == "" {
++			continue
++		}
++		if _, exists := seen[m]; exists {
++			continue
++		}
++		seen[m] = struct{}{}
++		out = append(out, m)
++	}
++	return out
++}
+diff --git a/internal/api/server_middleware.go b/internal/api/server_middleware.go
+index 447f280..3f67362 100644
+--- a/internal/api/server_middleware.go
++++ b/internal/api/server_middleware.go
+@@ -170,6 +170,11 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
+ 				c.Set("accessProvider", result.Provider)
+ 				if len(result.Metadata) > 0 {
+ 					c.Set("accessMetadata", result.Metadata)
++					// Also carry the metadata on the request context so downstream
++					// execution paths (model whitelist checks) can read it without
++					// needing the gin context.
++					req := c.Request.WithContext(sdkaccess.WithAuthMetadata(c.Request.Context(), result.Metadata))
++					c.Request = req
+ 				}
+ 			}
+ 			c.Next()
+diff --git a/internal/config/sdk_config.go b/internal/config/sdk_config.go
+index c7a53ff..0dec475 100644
+--- a/internal/config/sdk_config.go
++++ b/internal/config/sdk_config.go
+@@ -51,6 +51,19 @@ type SDKConfig struct {
+ 	// APIKeys is a list of keys for authenticating clients to this proxy server.
+ 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
+ 
++	// APIKeyModels optionally restricts which models each client API key may
++	// request. Keys are the API key values from api-keys; values are the list
++	// of allowed model names. An empty/missing entry means the key can access
++	// all models.
++	//
++	// Example:
++	//
++	//	api-key-models:
++	//	  sk-abc123:
++	//	    - deepseek-v4-flash
++	//	    - gpt-5.6-luna
++	APIKeyModels map[string][]string `yaml:"api-key-models,omitempty" json:"api-key-models,omitempty"`
++
+ 	// PassthroughHeaders controls whether upstream response headers are forwarded to downstream clients.
+ 	// Default is false (disabled).
+ 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
+diff --git a/sdk/access/apikey_metadata.go b/sdk/access/apikey_metadata.go
+new file mode 100644
+index 0000000..d75fcc5
+--- /dev/null
++++ b/sdk/access/apikey_metadata.go
+@@ -0,0 +1,84 @@
++package access
++
++import (
++	"context"
++	"strings"
++)
++
++// apiKeyMetadataContextKey carries the authenticated API key metadata (including
++// the optional model whitelist) on the request context so downstream execution
++// paths can enforce per-key model restrictions without the gin context.
++type apiKeyMetadataContextKeyType struct{}
++
++var apiKeyMetadataContextKey apiKeyMetadataContextKeyType
++
++// apiKeyModelWhitelistContextKey carries the parsed model whitelist slice for the
++// authenticated API key, or nil when the key has no whitelist configured.
++type apiKeyModelWhitelistContextKeyType struct{}
++
++var apiKeyModelWhitelistContextKey apiKeyModelWhitelistContextKeyType
++
++// ContextKeyModelWhitelist returns the typed context key used to carry the parsed
++// model whitelist. It is exported so middleware in other packages can set the
++// value with a shared key.
++func ContextKeyModelWhitelist() any { return apiKeyModelWhitelistContextKey }
++
++// ContextKeyMetadata returns the typed context key used to carry the raw auth
++// metadata map.
++func ContextKeyMetadata() any { return apiKeyMetadataContextKey }
++
++// WithAuthMetadata attaches the auth result metadata to ctx.
++func WithAuthMetadata(ctx context.Context, metadata map[string]string) context.Context {
++	if ctx == nil || len(metadata) == 0 {
++		return ctx
++	}
++	ctx = context.WithValue(ctx, apiKeyMetadataContextKey, metadata)
++	if raw, ok := metadata["model-whitelist"]; ok && raw != "" {
++		var models []string
++		for _, part := range strings.Split(raw, ",") {
++			if m := strings.TrimSpace(part); m != "" {
++				models = append(models, m)
++			}
++		}
++		if len(models) > 0 {
++			ctx = context.WithValue(ctx, apiKeyModelWhitelistContextKey, models)
++		}
++	}
++	return ctx
++}
++
++// ModelWhitelistFromContext returns the model whitelist for the authenticated
++// API key, or nil when the key is unrestricted or no metadata was attached.
++func ModelWhitelistFromContext(ctx context.Context) []string {
++	if ctx == nil {
++		return nil
++	}
++	if v, ok := ctx.Value(apiKeyModelWhitelistContextKey).([]string); ok {
++		return v
++	}
++	if meta, ok := ctx.Value(apiKeyMetadataContextKey).(map[string]string); ok {
++		if raw, ok := meta["model-whitelist"]; ok && raw != "" {
++			var models []string
++			for _, part := range strings.Split(raw, ",") {
++				if m := strings.TrimSpace(part); m != "" {
++					models = append(models, m)
++				}
++			}
++			if len(models) > 0 {
++				return models
++			}
++		}
++	}
++	return nil
++}
++
++// MetadataFromContext returns the raw auth metadata map attached to ctx (nil if none).
++func MetadataFromContext(ctx context.Context) map[string]string {
++    if ctx == nil {
++        return nil
++    }
++    if meta, ok := ctx.Value(apiKeyMetadataContextKey).(map[string]string); ok {
++        return meta
++    }
++    return nil
++}
+diff --git a/sdk/api/handlers/handlers.go b/sdk/api/handlers/handlers.go
+index cf31c5e..19bd22c 100644
+--- a/sdk/api/handlers/handlers.go
++++ b/sdk/api/handlers/handlers.go
+@@ -4,6 +4,8 @@
+ package handlers
+ 
+ import (
++
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+ 	"bytes"
+ 	"encoding/json"
+ 	"fmt"
+@@ -403,6 +405,17 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
+ 		requestCtx = c.Request.Context()
+ 	}
+ 
++	// Carry the authenticated API key metadata (e.g. per-key model whitelist)
++	// from the request context into the new context: callers derive their
++	// execution context from context.Background(), which would otherwise drop it.
++	newParent := parentCtx
++	if meta := sdkaccess.MetadataFromContext(requestCtx); len(meta) > 0 {
++		newParent = sdkaccess.WithAuthMetadata(newParent, meta)
++	}
++
++	newCtx, cancel := context.WithCancel(newParent)
++
++
+ 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
+ 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
+ 			parentCtx = logging.WithRequestID(parentCtx, requestID)
+@@ -410,8 +423,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
+ 			parentCtx = logging.WithRequestID(parentCtx, requestID)
+ 		}
+ 	}
+-	newCtx, cancel := context.WithCancel(parentCtx)
+-
++	
+ 	endpoint := ""
+ 	if c != nil && c.Request != nil {
+ 		path := strings.TrimSpace(c.FullPath())
+diff --git a/sdk/api/handlers/handlers_execution.go b/sdk/api/handlers/handlers_execution.go
+index ac521ec..64dc9a2 100644
+--- a/sdk/api/handlers/handlers_execution.go
++++ b/sdk/api/handlers/handlers_execution.go
+@@ -54,6 +54,9 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
+ 	if errMsg != nil {
+ 		return nil, nil, errMsg
+ 	}
++	if whitelistErr := h.enforceModelWhitelist(ctx, normalizedModel); whitelistErr != nil {
++		return nil, nil, whitelistErr
++	}
+ 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+ 	reqMeta := requestExecutionMetadata(ctx)
+ 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+diff --git a/sdk/api/handlers/handlers_stream.go b/sdk/api/handlers/handlers_stream.go
+index f476e10..446e275 100644
+--- a/sdk/api/handlers/handlers_stream.go
++++ b/sdk/api/handlers/handlers_stream.go
+@@ -312,6 +312,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
+ 		close(errChan)
+ 		return nil, nil, errChan
+ 	}
++	if whitelistErr := h.enforceModelWhitelist(ctx, normalizedModel); whitelistErr != nil {
++		errChan := make(chan *interfaces.ErrorMessage, 1)
++		errChan <- whitelistErr
++		close(errChan)
++		return nil, nil, errChan
++	}
+ 	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
+ 	reqMeta := requestExecutionMetadata(ctx)
+ 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+diff --git a/sdk/api/handlers/openai/openai_handlers.go b/sdk/api/handlers/openai/openai_handlers.go
+index efc6f95..3214ef2 100644
+--- a/sdk/api/handlers/openai/openai_handlers.go
++++ b/sdk/api/handlers/openai/openai_handlers.go
+@@ -7,6 +7,10 @@
+ package openai
+ 
+ import (
++
++	"strings"
++
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -67,6 +71,26 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
+ 	// Get all available models
+ 	allModels := h.Models()
+ 
++	// Per-key model whitelist (api-key-models): when the authenticated key has
++	// one configured, only expose those models in the list.
++	if whitelist := sdkaccess.ModelWhitelistFromContext(c.Request.Context()); len(whitelist) > 0 {
++		allowed := make(map[string]struct{}, len(whitelist))
++		for _, name := range whitelist {
++			allowed[strings.TrimSpace(name)] = struct{}{}
++		}
++		restricted := make([]map[string]any, 0, len(whitelist))
++		for _, model := range allModels {
++			id := ""
++			if v, ok := model["id"].(string); ok {
++				id = strings.TrimSpace(v)
++			}
++			if _, ok := allowed[id]; ok {
++				restricted = append(restricted, model)
++			}
++		}
++		allModels = restricted
++	}
++
+ 	// Filter to only include the 4 required fields: id, object, created, owned_by
+ 	filteredModels := make([]map[string]any, len(allModels))
+ 	for i, model := range allModels {
