@@ -541,6 +541,35 @@ sed -i 's|eceasy/cli-proxy-api:whitelist-v7.2.159-norm2-gpt6$|eceasy/cli-proxy-a
 docker compose up -d --no-deps cli-proxy-api
 ```
 
+### 2026-09-16 CPA 瞬态错误冷却 15s → 2s（配置变更，非镜像变更）
+
+**触发**：freebuff2api-go 侧报「调用模型 503」，反查确认 503 由 CPA 打出、与 freebuff 上游无关（源站该时段零 POST、零 5xx）。
+
+**根因**：CPA 对上游瞬时错误（408/500/502/503/504）会冷却该 provider 的凭证，冷却窗口内的新请求**不发上游请求**、直接返回 `503 auth_unavailable`。本次时间线：
+
+| 时刻 | 现象 |
+|---|---|
+| 19:24:40 | CPA→Cloudflare `104.21.22.113:443` `read: connection reset by peer`（一次 CF 边缘连接中断） |
+| 19:24:42 / 19:24:48 | `503 \| 75ms / 71ms`，未发上游请求（freebuff 源站 nginx 无对应记录） |
+| 19:24:57 | 冷却结束，恢复 200 |
+
+**改动**：
+```bash
+cp -a /opt/cpa/cli-config.yaml /opt/cpa/cli-config.yaml.bak.20260916-113442
+# transient-error-cooldown-seconds: 15 → 2（同步更新上方注释，记录 09-10 的 60→15 与本次 15→2）
+cd /opt/cpa && docker compose restart cli-proxy-api
+```
+
+**验证**：启动日志 `API server started successfully on: :8317` + `21 clients (1 Codex keys + 20 OpenAI-compat)`、无 panic/fatal；公网 `FB/deepseek-v4-flash` → **200 / 7.06s / `COOL2OK`**。
+
+**回滚**：
+```bash
+cp /opt/cpa/cli-config.yaml.bak.20260916-113442 /opt/cpa/cli-config.yaml
+cd /opt/cpa && docker compose restart cli-proxy-api
+```
+
+> ⚠️ **自定义资产**：该值在宿主机挂载文件里、**不在镜像内**。换机 / 重建 `/opt/cpa` / 从旧备份还原配置时**必须重新应用**（上游默认值不等于 2s）；否则「一次上游抖动 → 连续 503」的问题会复现。
+
 ### 回滚
 
 ```bash
@@ -690,7 +719,12 @@ api-keys:
 api-key-models:       # 白名单（自研字段，可省略）
   sk-xxx:
     - deepseek-v4-flash
+transient-error-cooldown-seconds: 2   # 自研调优：上游瞬态错误（408/500/502/503/504）后的凭证冷却秒数
+                                      # 冷却窗口内的请求不发上游、直接 503 auth_unavailable
+                                      # 2026-09-10 60→15（避免重试连环 503）；2026-09-16 15→2
 ```
+
+> 自定义调优值（非上游默认）：换机/重建配置时须重新设置，原因与证据见上方「2026-09-16 CPA 瞬态错误冷却 15s → 2s」。
 
 ### nginx（/etc/nginx/sites-available/api.274747.xyz）
 - 80 → 301 HTTPS；443 ssl → /v1/ 转 CPA:8317，/ 转 CPAMP:18317

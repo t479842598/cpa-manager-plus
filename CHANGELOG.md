@@ -8,6 +8,30 @@
 
 ---
 
+## 2026-09-16 — CPA 瞬态错误冷却 15s → 2s（配置变更，不动镜像；属自定义资产）
+
+### 变更
+
+- `/opt/cpa/cli-config.yaml`：`transient-error-cooldown-seconds` **15 → 2**（本轮唯一的运行时改动，镜像与补丁均未变）。
+- 机制：CPA 对上游瞬时错误（408/500/502/503/504）会冷却该 provider 的凭证，**冷却窗口内的新请求不发起上游调用、直接返回 `503 auth_unavailable`**（CLIProxyAPI issue #2261 / #4787 同类现象）。2026-09-10 已从默认 60s 下调到 15s，本次实测 15s 仍然过长。
+- 触发证据（2026-09-16 19:24，由 freebuff2api-go 侧报「调用模型 503」反查）：
+  - `19:24:40` CPA → Cloudflare（`104.21.22.113:443`）连接被 reset：`read: connection reset by peer`；
+  - `19:24:42` / `19:24:48` 两次 `503 | 75ms / 71ms`（耗时说明**未发上游请求**）；同一时段 freebuff 源站 nginx access.log **无对应 POST 记录**、服务日志零 ERROR；
+  - `19:24:57` 冷却结束，恢复 200。
+- 选 2s 的理由：社区实测值（2s 让 Agent 的重试节奏落在冷却窗口外）；免费 provider 的账号级轮换由下游网关（freebuff2api-go，189 账号池）自行处理，CPA 这层不需要长冷却。
+
+### 验证
+
+- `cd /opt/cpa && docker compose restart cli-proxy-api`：启动日志 `API server started successfully on: :8317`、`21 clients (1 Codex keys + 20 OpenAI-compat)`，无 panic / fatal。
+- 公网复测：`https://api.274747.xyz/v1/chat/completions` 调 `FB/deepseek-v4-flash` → **200 / 7.06s**，正文 `COOL2OK`。
+- 改动为一行数值 + 注释，其余 provider / 白名单 / headers 配置零变化。
+
+### 备注（自定义资产，必须随配置一起迁移）
+
+- 该值是**宿主机挂载文件**里的自定义值（`/opt/cpa/cli-config.yaml` → 容器 `/CLIProxyAPI/config.yaml`），**不在镜像内**。重建 `/opt/cpa`、换机器、或从旧备份还原配置时**必须重新应用本值**，否则会退回上游默认行为（默认值不等于 2s）。
+- 改动前备份：`/opt/cpa/cli-config.yaml.bak.20260916-113442`。
+- 回滚：`cp /opt/cpa/cli-config.yaml.bak.20260916-113442 /opt/cpa/cli-config.yaml && cd /opt/cpa && docker compose restart cli-proxy-api`。
+
 ## 2026-09-14 — GPT-6 家族自动 Codex 身份头（正式标签 `whitelist-v7.2.159-norm2-gpt6`，已部署生产）
 
 ### 新增
