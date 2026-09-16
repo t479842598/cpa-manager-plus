@@ -630,6 +630,11 @@ docker build --build-arg VERSION=v<新版本> --build-arg COMMIT=<sha> \
 #    验证项含：版本号 / 不受限与受限模型数 / 白名单外 403 / management 401+200
 #              / Responses 流顺序 0 违规 / 流式与非流式 chat / 日志零 panic
 cd /opt/cpa && docker compose up -d --no-deps cli-proxy-api
+
+# 4. 配置自定义值必须核对（cli-config.yaml 不在镜像内，升级不会自动带上）
+#    当前自定义值：transient-error-cooldown-seconds: 2（2026-09-16，上游默认不等于 2）
+#                  以及 api-key-models 白名单 / payload.default / codex.headers 等本地配置
+grep -nE "transient-error-cooldown-seconds|api-key-models|prompt_cache_key" /opt/cpa/cli-config.yaml
 ```
 
 ### 更新 CPAMP（保留白名单 UI！）
