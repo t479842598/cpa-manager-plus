@@ -39,6 +39,10 @@
 - 生产复测：`/v1/models` 受限 key 28 个、越权 `403 model_not_allowed`、`GET /v0/management/api-key-models` 200 / 无 key 401、公网 HTTPS 三项通过、CPA/CPAMP 日志 panic/fatal **0**。
 - 白名单**写路径**在生产上做了可逆验证（追加→生效→复原）：追加后条目落盘且该模型放行，复原后文件与内存均与初始一致、越权重新 403；生产配置零残留（与写测试前逐项相等）。
 
+- **离线维护（迁移收尾，曾被漏做后补齐）**：CPAMP v1.14.1 的迁移把 12 个查询索引与 1 个清理任务**延后到离线命令**（启动日志 `[derived-migration] deferred index preparation indexes=12 … command=cleanup-derived`）。切换当天我误把迁移日志当作收尾完成，面板随后持续显示「数据库升级维护尚未完成 · 性能降级」。已按面板指引补做：停 CPAMP → 清理前快照（`/opt/cpa/backups/pre-cleanup-derived-20260926T110050Z/`，92 MB，sha256 `3cfde22f…`）→ `docker compose run --rm --no-deps cpa-manager-plus cleanup-derived --db-path /data/usage.sqlite` → 启 CPAMP。
+  实测：`creating index …` 12 个（含重建 legacy 表上的 3 个过期索引）、`Derived cleanup completed: jobs=1 processed_rows=0 prepared_indexes=12`；`/status` 的 `databaseMaintenance` 变为 `{required:false, performanceDegraded:false, deferredIndexes:0, offlineJobs:0, reasons:[]}`（横幅消失）、`integrity_check=ok`、`usage_events` 持续增长（83131 → 83390）、collector `deadLetters=0`、CPA/CPAMP 健康检查全 200。
+  ⚠️ **下次升级 CPAMP 必查**：升级后 `curl -H "Authorization: Bearer <admin>" /status` 看 `databaseMaintenance.required` 是否为 `false`；为 `true` 就说明还有 deferred 索引/离线任务没做。
+
 ### 回滚
 
 ```bash

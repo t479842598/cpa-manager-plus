@@ -675,6 +675,29 @@ docker rm -f cpa-canary cpamp-canary cpamp-canary2 cpa-sandbox  # 清灰度容�
 CPAMP `v1.12.5 → v1.14.1`（**9 文件**，旧补丁存 `cpamp-whitelist.patch.bak-pre-v1141`）。两个补丁均在干净 tag 上
 plain `git apply --check` + 逐文件 `cmp` 一致（30/30、9/9）+ `go build` / `tsc` / `vitest` / `vite build` 通过。
 
+**离线维护（v1.14.1 迁移的收尾，必做）**：迁移把 12 个查询索引延后 + 1 个清理任务转离线，
+面板会持续显示「数据库升级维护尚未完成 · 性能降级」横幅，日志里有
+`[derived-migration] deferred index preparation indexes=12 … command=cleanup-derived`。
+处理（按面板给的命令；先做清理前快照）：
+
+```bash
+cd /opt/cpa
+docker compose stop cpa-manager-plus
+# 清理前快照（备份先行约定）
+BK=backups/pre-cleanup-derived-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p $BK
+docker run --rm -v cpa_cpa-manager-plus-data:/from:ro -v $PWD/$BK:/to alpine sh -c "cd /from && tar czf /to/cpamp-volume.tar.gz ."
+# 离线执行（用相同版本镜像）
+docker compose run --rm --no-deps cpa-manager-plus cleanup-derived --db-path /data/usage.sqlite
+docker compose start cpa-manager-plus
+```
+
+实测输出：`creating index …`（12 个）+ 移除/重建 legacy 表上的 3 个过期索引，
+`Derived cleanup completed: jobs=1 processed_rows=0 prepared_indexes=12`。
+验证：`/status` 的 `databaseMaintenance` 变为 `{required:false, performanceDegraded:false,
+deferredIndexes:0, offlineJobs:0, reasons:[]}`（横幅自动消失）；`integrity_check=ok`；
+`usage_events` 继续增长；collector `deadLetters=0`。
+清理前快照：`backups/pre-cleanup-derived-20260926T110050Z/`（91 MB，sha256 `3cfde22f…`）。
+
 **另一个已观察到的安全行为（起 canary 时必知）**：两个 CPAMP 实例指向同一 `usage.sqlite` 时，
 后启动的会以 `manager database process lock is already held` 退出（`Exited (1)`）——这是有意的进程锁，
 不是缺陷；起 canary 请各用一份数据副本。
