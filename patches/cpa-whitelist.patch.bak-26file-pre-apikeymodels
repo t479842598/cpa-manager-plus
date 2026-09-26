@@ -82,511 +82,6 @@ index 915160b7..36be6a11 100644
 +	}
 +	return out
 +}
-diff --git a/internal/api/handlers/management/config_api_key_models.go b/internal/api/handlers/management/config_api_key_models.go
-new file mode 100644
-index 00000000..2e89d39d
---- /dev/null
-+++ b/internal/api/handlers/management/config_api_key_models.go
-@@ -0,0 +1,199 @@
-+package management
-+
-+import (
-+	"encoding/json"
-+	"net/http"
-+	"strings"
-+
-+	"github.com/gin-gonic/gin"
-+)
-+
-+// api-key-models: map[string][]string (per client API key model whitelist)
-+//
-+// These handlers mirror the api-keys endpoints so the control panel can persist
-+// a key together with its whitelist through the management API instead of
-+// rewriting config.yaml as a whole. Every mutation goes through h.persist,
-+// which saves the file and triggers the normal reload path
-+// (watcher -> access provider rebuild), so a whitelist change takes effect
-+// immediately.
-+
-+// normalizeAPIKeyModels trims/dedupes model names and drops empty entries.
-+// Keys are API key values and therefore case sensitive; they are only trimmed.
-+func normalizeAPIKeyModels(entries map[string][]string) map[string][]string {
-+	if len(entries) == 0 {
-+		return nil
-+	}
-+	out := make(map[string][]string, len(entries))
-+	for rawKey, models := range entries {
-+		key := strings.TrimSpace(rawKey)
-+		if key == "" {
-+			continue
-+		}
-+		normalized := normalizeWhitelistModels(models)
-+		if len(normalized) == 0 {
-+			// An empty whitelist means "unrestricted", so the entry is dropped
-+			// entirely rather than stored as an allow-nothing list.
-+			continue
-+		}
-+		out[key] = normalized
-+	}
-+	if len(out) == 0 {
-+		return nil
-+	}
-+	return out
-+}
-+
-+func normalizeWhitelistModels(models []string) []string {
-+	if len(models) == 0 {
-+		return nil
-+	}
-+	out := make([]string, 0, len(models))
-+	seen := make(map[string]struct{}, len(models))
-+	for _, raw := range models {
-+		m := strings.TrimSpace(raw)
-+		if m == "" {
-+			continue
-+		}
-+		if _, exists := seen[m]; exists {
-+			continue
-+		}
-+		seen[m] = struct{}{}
-+		out = append(out, m)
-+	}
-+	if len(out) == 0 {
-+		return nil
-+	}
-+	return out
-+}
-+
-+func (h *Handler) GetAPIKeyModels(c *gin.Context) {
-+	models := h.cfg.APIKeyModels
-+	if models == nil {
-+		models = map[string][]string{}
-+	}
-+	c.JSON(http.StatusOK, gin.H{"api-key-models": models})
-+}
-+
-+func (h *Handler) PutAPIKeyModels(c *gin.Context) {
-+	data, err := c.GetRawData()
-+	if err != nil {
-+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
-+		return
-+	}
-+	entries, ok := parseAPIKeyModelsBody(data)
-+	if !ok {
-+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-+		return
-+	}
-+	h.cfg.APIKeyModels = normalizeAPIKeyModels(entries)
-+	h.persist(c)
-+}
-+
-+// parseAPIKeyModelsBody accepts either the bare mapping
-+// ({"sk-a":["model-a"]}) or the wrapped form GET returns
-+// ({"api-key-models":{...}} / {"items":{...}}), so a read-modify-write round
-+// trip against this API works without reshaping the payload.
-+func parseAPIKeyModelsBody(data []byte) (map[string][]string, bool) {
-+	trimmed := strings.TrimSpace(string(data))
-+	if trimmed == "" || trimmed == "null" {
-+		return nil, true
-+	}
-+	var raw map[string]json.RawMessage
-+	if errRaw := json.Unmarshal(data, &raw); errRaw != nil {
-+		return nil, false
-+	}
-+	for _, wrapperKey := range []string{"api-key-models", "items"} {
-+		value, ok := raw[wrapperKey]
-+		if !ok {
-+			continue
-+		}
-+		var entries map[string][]string
-+		if errValue := json.Unmarshal(value, &entries); errValue != nil {
-+			return nil, false
-+		}
-+		return entries, true
-+	}
-+	entries := make(map[string][]string, len(raw))
-+	for key, value := range raw {
-+		var models []string
-+		if errValue := json.Unmarshal(value, &models); errValue != nil {
-+			return nil, false
-+		}
-+		entries[key] = models
-+	}
-+	return entries, true
-+}
-+
-+// PatchAPIKeyModels declaratively syncs the whitelist of a single API key:
-+// a non-empty models list sets the entry, an empty list removes it (making the
-+// key unrestricted). Both directions are idempotent and always answer 200 so
-+// the control panel can express "this key should have exactly these models"
-+// without having to interpret 404s when an entry is already absent.
-+func (h *Handler) PatchAPIKeyModels(c *gin.Context) {
-+	var body struct {
-+		APIKey *string  `json:"api-key"`
-+		Key    *string  `json:"key"`
-+		Models []string `json:"models"`
-+	}
-+	if err := c.ShouldBindJSON(&body); err != nil {
-+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-+		return
-+	}
-+	rawKey := body.APIKey
-+	if rawKey == nil {
-+		rawKey = body.Key
-+	}
-+	if rawKey == nil {
-+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing api-key"})
-+		return
-+	}
-+	key := strings.TrimSpace(*rawKey)
-+	if key == "" {
-+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing api-key"})
-+		return
-+	}
-+
-+	normalized := normalizeWhitelistModels(body.Models)
-+	if len(normalized) == 0 {
-+		if h.cfg.APIKeyModels != nil {
-+			delete(h.cfg.APIKeyModels, key)
-+			if len(h.cfg.APIKeyModels) == 0 {
-+				h.cfg.APIKeyModels = nil
-+			}
-+		}
-+		h.persist(c)
-+		return
-+	}
-+
-+	if h.cfg.APIKeyModels == nil {
-+		h.cfg.APIKeyModels = make(map[string][]string)
-+	}
-+	h.cfg.APIKeyModels[key] = normalized
-+	h.persist(c)
-+}
-+
-+// DeleteAPIKeyModels removes one key's whitelist entry. Unlike PATCH this is an
-+// explicit removal, so an unknown key reports 404 instead of silently succeeding.
-+func (h *Handler) DeleteAPIKeyModels(c *gin.Context) {
-+	key := strings.TrimSpace(c.Query("api-key"))
-+	if key == "" {
-+		key = strings.TrimSpace(c.Query("key"))
-+	}
-+	if key == "" {
-+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing api-key"})
-+		return
-+	}
-+	if h.cfg.APIKeyModels == nil {
-+		c.JSON(http.StatusNotFound, gin.H{"error": "api key whitelist not found"})
-+		return
-+	}
-+	if _, ok := h.cfg.APIKeyModels[key]; !ok {
-+		c.JSON(http.StatusNotFound, gin.H{"error": "api key whitelist not found"})
-+		return
-+	}
-+	delete(h.cfg.APIKeyModels, key)
-+	if len(h.cfg.APIKeyModels) == 0 {
-+		h.cfg.APIKeyModels = nil
-+	}
-+	h.persist(c)
-+}
-diff --git a/internal/api/handlers/management/config_api_key_models_test.go b/internal/api/handlers/management/config_api_key_models_test.go
-new file mode 100644
-index 00000000..219c0bc1
---- /dev/null
-+++ b/internal/api/handlers/management/config_api_key_models_test.go
-@@ -0,0 +1,294 @@
-+package management
-+
-+import (
-+	"encoding/json"
-+	"net/http"
-+	"net/http/httptest"
-+	"os"
-+	"path/filepath"
-+	"strings"
-+	"testing"
-+
-+	"github.com/gin-gonic/gin"
-+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-+	"gopkg.in/yaml.v3"
-+)
-+
-+func newAPIKeyModelsHandler(t *testing.T, models map[string][]string) *Handler {
-+	t.Helper()
-+
-+	dir := t.TempDir()
-+	path := filepath.Join(dir, "config.yaml")
-+	if errWrite := os.WriteFile(path, []byte("{}\n"), 0o600); errWrite != nil {
-+		t.Fatalf("failed to write test config: %v", errWrite)
-+	}
-+	cfg := &config.Config{}
-+	cfg.APIKeyModels = models
-+	return &Handler{
-+		cfg:            cfg,
-+		configFilePath: path,
-+	}
-+}
-+
-+func performJSON(h *Handler, method, target, body string, fn func(*gin.Context)) *httptest.ResponseRecorder {
-+	rec := httptest.NewRecorder()
-+	c, _ := gin.CreateTestContext(rec)
-+	req := httptest.NewRequest(method, target, strings.NewReader(body))
-+	req.Header.Set("Content-Type", "application/json")
-+	c.Request = req
-+	fn(c)
-+	return rec
-+}
-+
-+func readAPIKeyModelsFromDisk(t *testing.T, h *Handler) map[string][]string {
-+	t.Helper()
-+
-+	data, errRead := os.ReadFile(h.configFilePath)
-+	if errRead != nil {
-+		t.Fatalf("failed to read persisted config: %v", errRead)
-+	}
-+	var parsed struct {
-+		APIKeyModels map[string][]string `yaml:"api-key-models"`
-+	}
-+	if errUnmarshal := yaml.Unmarshal(data, &parsed); errUnmarshal != nil {
-+		t.Fatalf("failed to parse persisted config: %v", errUnmarshal)
-+	}
-+	return parsed.APIKeyModels
-+}
-+
-+func TestGetAPIKeyModels_EmptyReturnsEmptyObject(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, nil)
-+	rec := performJSON(h, http.MethodGet, "/v0/management/api-key-models", "", h.GetAPIKeyModels)
-+
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+	var payload map[string]map[string][]string
-+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
-+		t.Fatalf("failed to parse response: %v", errUnmarshal)
-+	}
-+	got, ok := payload["api-key-models"]
-+	if !ok {
-+		t.Fatalf("response missing api-key-models field: %s", rec.Body.String())
-+	}
-+	if got == nil {
-+		t.Fatalf("api-key-models = null, want empty object")
-+	}
-+	if len(got) != 0 {
-+		t.Fatalf("api-key-models = %#v, want empty", got)
-+	}
-+}
-+
-+func TestPatchAPIKeyModels_SetsAndPersistsWhitelist(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, nil)
-+	rec := performJSON(
-+		h,
-+		http.MethodPatch,
-+		"/v0/management/api-key-models",
-+		`{"api-key":"sk-restricted","models":["  model-a ","model-b","model-a",""]}`,
-+		h.PatchAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+	got := h.cfg.APIKeyModels["sk-restricted"]
-+	if len(got) != 2 || got[0] != "model-a" || got[1] != "model-b" {
-+		t.Fatalf("in-memory whitelist = %#v, want [model-a model-b]", got)
-+	}
-+	persisted := readAPIKeyModelsFromDisk(t, h)
-+	if len(persisted["sk-restricted"]) != 2 {
-+		t.Fatalf("persisted whitelist = %#v, want 2 entries", persisted)
-+	}
-+}
-+
-+func TestPatchAPIKeyModels_EmptyModelsRemovesEntry(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, map[string][]string{
-+		"sk-a": {"model-a"},
-+		"sk-b": {"model-b"},
-+	})
-+	rec := performJSON(
-+		h,
-+		http.MethodPatch,
-+		"/v0/management/api-key-models",
-+		`{"api-key":"sk-a","models":[]}`,
-+		h.PatchAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+	if _, ok := h.cfg.APIKeyModels["sk-a"]; ok {
-+		t.Fatalf("sk-a whitelist still present after empty patch: %#v", h.cfg.APIKeyModels)
-+	}
-+	if len(h.cfg.APIKeyModels) != 1 {
-+		t.Fatalf("whitelist map = %#v, want only sk-b", h.cfg.APIKeyModels)
-+	}
-+	if persisted := readAPIKeyModelsFromDisk(t, h); len(persisted) != 1 {
-+		t.Fatalf("persisted whitelist = %#v, want only sk-b", persisted)
-+	}
-+}
-+
-+// Clearing the whitelist of a key that never had one is a no-op success: the
-+// panel sends the desired end state, not a diff.
-+func TestPatchAPIKeyModels_EmptyModelsOnUnknownKeyIsIdempotent(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, map[string][]string{"sk-a": {"model-a"}})
-+	rec := performJSON(
-+		h,
-+		http.MethodPatch,
-+		"/v0/management/api-key-models",
-+		`{"api-key":"sk-missing","models":[]}`,
-+		h.PatchAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+	if len(h.cfg.APIKeyModels) != 1 {
-+		t.Fatalf("whitelist map mutated by idempotent patch: %#v", h.cfg.APIKeyModels)
-+	}
-+}
-+
-+func TestPatchAPIKeyModels_RequiresAPIKey(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, nil)
-+	rec := performJSON(
-+		h,
-+		http.MethodPatch,
-+		"/v0/management/api-key-models",
-+		`{"models":["model-a"]}`,
-+		h.PatchAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusBadRequest {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
-+	}
-+}
-+
-+func TestPutAPIKeyModels_ReplacesWholeMap(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, map[string][]string{"sk-old": {"model-old"}})
-+	rec := performJSON(
-+		h,
-+		http.MethodPut,
-+		"/v0/management/api-key-models",
-+		`{"api-key-models":{"sk-new":["model-new"]}}`,
-+		h.PutAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+	if len(h.cfg.APIKeyModels) != 1 {
-+		t.Fatalf("whitelist map = %#v, want only sk-new", h.cfg.APIKeyModels)
-+	}
-+	if got := h.cfg.APIKeyModels["sk-new"]; len(got) != 1 || got[0] != "model-new" {
-+		t.Fatalf("sk-new whitelist = %#v, want [model-new]", got)
-+	}
-+	if persisted := readAPIKeyModelsFromDisk(t, h); len(persisted) != 1 {
-+		t.Fatalf("persisted whitelist = %#v, want only sk-new", persisted)
-+	}
-+}
-+
-+func TestPutAPIKeyModels_DropsEmptyAndBlankEntries(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, nil)
-+	rec := performJSON(
-+		h,
-+		http.MethodPut,
-+		"/v0/management/api-key-models",
-+		`{"api-key-models":{"sk-blank":[],"":["model-a"],"sk-ok":["model-a"]}}`,
-+		h.PutAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+	if len(h.cfg.APIKeyModels) != 1 {
-+		t.Fatalf("whitelist map = %#v, want only sk-ok", h.cfg.APIKeyModels)
-+	}
-+	if persisted := readAPIKeyModelsFromDisk(t, h); len(persisted) != 1 {
-+		t.Fatalf("persisted whitelist = %#v, want only sk-ok", persisted)
-+	}
-+}
-+
-+func TestDeleteAPIKeyModels_RemovesEntry(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, map[string][]string{"sk-a": {"model-a"}})
-+	rec := performJSON(
-+		h,
-+		http.MethodDelete,
-+		"/v0/management/api-key-models?api-key=sk-a",
-+		"",
-+		h.DeleteAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+	if h.cfg.APIKeyModels != nil {
-+		t.Fatalf("whitelist map = %#v, want nil after deleting the last entry", h.cfg.APIKeyModels)
-+	}
-+}
-+
-+func TestDeleteAPIKeyModels_UnknownKeyIsNotFound(t *testing.T) {
-+	t.Parallel()
-+
-+	h := newAPIKeyModelsHandler(t, map[string][]string{"sk-a": {"model-a"}})
-+	rec := performJSON(
-+		h,
-+		http.MethodDelete,
-+		"/v0/management/api-key-models?api-key=sk-missing",
-+		"",
-+		h.DeleteAPIKeyModels,
-+	)
-+
-+	if rec.Code != http.StatusNotFound {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
-+	}
-+	if len(h.cfg.APIKeyModels) != 1 {
-+		t.Fatalf("whitelist map mutated by failed delete: %#v", h.cfg.APIKeyModels)
-+	}
-+}
-+
-+// A whitelist written through the management API must be readable back as the
-+// exact model names the gateway enforces, so the panel and CPA agree.
-+func TestAPIKeyModels_RoundTripKeepsModelNamesVerbatim(t *testing.T) {
-+	t.Parallel()
-+
-+	names := []string{"天机阁/gpt-5.4", "hublinuxdo/deepseek-v4-flash", "any/gpt-6-astra"}
-+	h := newAPIKeyModelsHandler(t, nil)
-+	payload, errMarshal := json.Marshal(map[string]any{
-+		"api-key": "sk-cn",
-+		"models":  names,
-+	})
-+	if errMarshal != nil {
-+		t.Fatalf("failed to marshal payload: %v", errMarshal)
-+	}
-+	rec := performJSON(h, http.MethodPatch, "/v0/management/api-key-models", string(payload), h.PatchAPIKeyModels)
-+	if rec.Code != http.StatusOK {
-+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-+	}
-+
-+	persisted := readAPIKeyModelsFromDisk(t, h)["sk-cn"]
-+	if len(persisted) != len(names) {
-+		t.Fatalf("persisted whitelist = %#v, want %#v", persisted, names)
-+	}
-+	for i, want := range names {
-+		if persisted[i] != want {
-+			t.Fatalf("persisted[%d] = %q, want %q", i, persisted[i], want)
-+		}
-+	}
-+}
 diff --git a/internal/api/handlers/management/models.go b/internal/api/handlers/management/models.go
 new file mode 100644
 index 00000000..1cac9235
@@ -783,7 +278,7 @@ index 00000000..af41acf1
 +	}
 +}
 diff --git a/internal/api/server_management.go b/internal/api/server_management.go
-index e6911f6b..84e97b6c 100644
+index e6911f6b..12ead09d 100644
 --- a/internal/api/server_management.go
 +++ b/internal/api/server_management.go
 @@ -31,6 +31,9 @@ func (s *Server) registerManagementRoutes() {
@@ -796,19 +291,6 @@ index e6911f6b..84e97b6c 100644
  		mgmt.GET("/plugins", s.mgmt.ListPlugins)
  		mgmt.GET("/plugin-store", s.mgmt.ListPluginStore)
  		mgmt.POST("/plugin-store/:id/install", s.mgmt.InstallPluginFromStore)
-@@ -88,6 +91,12 @@ func (s *Server) registerManagementRoutes() {
- 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
- 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
- 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
-+		// Per-key model whitelist (api-key-models) managed next to the keys
-+		// themselves so the panel can save a key plus its whitelist in one step.
-+		mgmt.GET("/api-key-models", s.mgmt.GetAPIKeyModels)
-+		mgmt.PUT("/api-key-models", s.mgmt.PutAPIKeyModels)
-+		mgmt.PATCH("/api-key-models", s.mgmt.PatchAPIKeyModels)
-+		mgmt.DELETE("/api-key-models", s.mgmt.DeleteAPIKeyModels)
- 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
- 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
- 
 diff --git a/internal/api/server_middleware.go b/internal/api/server_middleware.go
 index 447f280c..3f673627 100644
 --- a/internal/api/server_middleware.go
@@ -825,128 +307,6 @@ index 447f280c..3f673627 100644
  				}
  			}
  			c.Next()
-diff --git a/internal/config/config_api_key_models_save_test.go b/internal/config/config_api_key_models_save_test.go
-new file mode 100644
-index 00000000..5722188a
---- /dev/null
-+++ b/internal/config/config_api_key_models_save_test.go
-@@ -0,0 +1,101 @@
-+package config
-+
-+import (
-+	"os"
-+	"path/filepath"
-+	"strings"
-+	"testing"
-+)
-+
-+// A whitelist entry removed through the management API must actually disappear
-+// from config.yaml. SaveConfigPreserveComments merges the generated config into
-+// the existing YAML tree, which keeps unknown keys of mappings it does not
-+// explicitly prune — so api-key-models has to be pruned like the oauth-* maps.
-+func TestSaveConfigPreserveComments_RemovesDeletedAPIKeyModels(t *testing.T) {
-+	configPath := filepath.Join(t.TempDir(), "config.yaml")
-+	initialYAML := `api-keys:
-+  - sk-free
-+  - sk-restricted
-+api-key-models:
-+  sk-restricted:
-+    - model-a
-+    - model-b
-+  sk-stale:
-+    - model-c
-+`
-+	if errWrite := os.WriteFile(configPath, []byte(initialYAML), 0o600); errWrite != nil {
-+		t.Fatalf("os.WriteFile() error = %v", errWrite)
-+	}
-+
-+	cfg := &Config{
-+		SDKConfig: SDKConfig{
-+			APIKeys: []string{"sk-free", "sk-restricted"},
-+			APIKeyModels: map[string][]string{
-+				"sk-restricted": {"model-a"},
-+			},
-+		},
-+	}
-+
-+	if errSave := SaveConfigPreserveComments(configPath, cfg); errSave != nil {
-+		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
-+	}
-+
-+	savedBytes, errRead := os.ReadFile(configPath)
-+	if errRead != nil {
-+		t.Fatalf("os.ReadFile() error = %v", errRead)
-+	}
-+	savedText := string(savedBytes)
-+
-+	if strings.Contains(savedText, "sk-stale") {
-+		t.Errorf("saved YAML still contains the removed key sk-stale; got:\n%s", savedText)
-+	}
-+	if strings.Contains(savedText, "model-b") {
-+		t.Errorf("saved YAML still contains the removed model model-b; got:\n%s", savedText)
-+	}
-+	if !strings.Contains(savedText, "model-a") {
-+		t.Errorf("saved YAML lost the remaining whitelist entry; got:\n%s", savedText)
-+	}
-+
-+	loadedCfg, errLoad := LoadConfigOptional(configPath, false)
-+	if errLoad != nil {
-+		t.Fatalf("LoadConfigOptional() error = %v", errLoad)
-+	}
-+	if got := loadedCfg.APIKeyModels["sk-restricted"]; len(got) != 1 || got[0] != "model-a" {
-+		t.Fatalf("reloaded whitelist = %#v, want [model-a]", got)
-+	}
-+	if _, exists := loadedCfg.APIKeyModels["sk-stale"]; exists {
-+		t.Fatalf("reloaded whitelist still has sk-stale: %#v", loadedCfg.APIKeyModels)
-+	}
-+}
-+
-+// Clearing every whitelist entry must drop the whole mapping, not leave an
-+// empty one behind.
-+func TestSaveConfigPreserveComments_DropsEmptyAPIKeyModels(t *testing.T) {
-+	configPath := filepath.Join(t.TempDir(), "config.yaml")
-+	initialYAML := `api-keys:
-+  - sk-restricted
-+api-key-models:
-+  sk-restricted:
-+    - model-a
-+`
-+	if errWrite := os.WriteFile(configPath, []byte(initialYAML), 0o600); errWrite != nil {
-+		t.Fatalf("os.WriteFile() error = %v", errWrite)
-+	}
-+
-+	cfg := &Config{
-+		SDKConfig: SDKConfig{
-+			APIKeys: []string{"sk-restricted"},
-+		},
-+	}
-+	if errSave := SaveConfigPreserveComments(configPath, cfg); errSave != nil {
-+		t.Fatalf("SaveConfigPreserveComments() error = %v", errSave)
-+	}
-+
-+	loadedCfg, errLoad := LoadConfigOptional(configPath, false)
-+	if errLoad != nil {
-+		t.Fatalf("LoadConfigOptional() error = %v", errLoad)
-+	}
-+	if len(loadedCfg.APIKeyModels) != 0 {
-+		t.Fatalf("reloaded whitelist = %#v, want empty", loadedCfg.APIKeyModels)
-+	}
-+}
-diff --git a/internal/config/config_yaml.go b/internal/config/config_yaml.go
-index e1286353..09b0b3d7 100644
---- a/internal/config/config_yaml.go
-+++ b/internal/config/config_yaml.go
-@@ -55,6 +55,10 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
- 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
- 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
- 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-request-scoped-errors")
-+	// api-key-models is a per-key mapping like the oauth-* ones above: without
-+	// pruning, a whitelist entry removed through the management API would stay
-+	// in the file and silently reappear on the next config reload.
-+	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "api-key-models")
- 	replacePluginConfigsSubtree(original.Content[0], generated.Content[0])
- 
- 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 diff --git a/internal/config/sdk_config.go b/internal/config/sdk_config.go
 index 5e4077b9..2ad1dad1 100644
 --- a/internal/config/sdk_config.go
@@ -1830,7 +1190,7 @@ index 80a71a28..afcb51e3 100644
 +}
 diff --git a/sdk/access/apikey_metadata.go b/sdk/access/apikey_metadata.go
 new file mode 100644
-index 00000000..c9f0b369
+index 00000000..d75fcc59
 --- /dev/null
 +++ b/sdk/access/apikey_metadata.go
 @@ -0,0 +1,84 @@
@@ -1910,27 +1270,28 @@ index 00000000..c9f0b369
 +
 +// MetadataFromContext returns the raw auth metadata map attached to ctx (nil if none).
 +func MetadataFromContext(ctx context.Context) map[string]string {
-+	if ctx == nil {
-+		return nil
-+	}
-+	if meta, ok := ctx.Value(apiKeyMetadataContextKey).(map[string]string); ok {
-+		return meta
-+	}
-+	return nil
++    if ctx == nil {
++        return nil
++    }
++    if meta, ok := ctx.Value(apiKeyMetadataContextKey).(map[string]string); ok {
++        return meta
++    }
++    return nil
 +}
 diff --git a/sdk/api/handlers/handlers.go b/sdk/api/handlers/handlers.go
-index b912697b..84f87170 100644
+index b912697b..279e7474 100644
 --- a/sdk/api/handlers/handlers.go
 +++ b/sdk/api/handlers/handlers.go
-@@ -7,6 +7,7 @@ import (
+@@ -4,6 +4,8 @@
+ package handlers
+ 
+ import (
++
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
  	"bytes"
  	"encoding/json"
  	"fmt"
-+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
- 	"net"
- 	"net/http"
- 	"reflect"
-@@ -486,6 +487,16 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
+@@ -486,6 +488,17 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
  		requestCtx = c.Request.Context()
  	}
  
@@ -1944,17 +1305,20 @@ index b912697b..84f87170 100644
 +
 +	newCtx, cancel := context.WithCancel(newParent)
 +
++
  	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
  		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
  			parentCtx = logging.WithRequestID(parentCtx, requestID)
-@@ -493,7 +504,6 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
+@@ -493,8 +506,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
  			parentCtx = logging.WithRequestID(parentCtx, requestID)
  		}
  	}
 -	newCtx, cancel := context.WithCancel(parentCtx)
- 
+-
++	
  	endpoint := ""
  	if c != nil && c.Request != nil {
+ 		path := strings.TrimSpace(c.FullPath())
 diff --git a/sdk/api/handlers/handlers_execution.go b/sdk/api/handlers/handlers_execution.go
 index 688260fb..01060c5f 100644
 --- a/sdk/api/handlers/handlers_execution.go
@@ -2159,23 +1523,21 @@ index 21222bb6..2cf27b3e 100644
  	reqMeta := requestExecutionMetadata(ctx)
  	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
 diff --git a/sdk/api/handlers/openai/openai_handlers.go b/sdk/api/handlers/openai/openai_handlers.go
-index 18e5ec94..2cb08428 100644
+index 18e5ec94..65dcda8f 100644
 --- a/sdk/api/handlers/openai/openai_handlers.go
 +++ b/sdk/api/handlers/openai/openai_handlers.go
-@@ -7,9 +7,12 @@
+@@ -7,6 +7,10 @@
  package openai
  
  import (
++
 +	"strings"
 +
++	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
  	"context"
  	"encoding/json"
  	"fmt"
-+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
- 	"net/http"
- 	"sync"
- 
-@@ -79,6 +82,26 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
+@@ -79,6 +83,26 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
  	// Get all available models
  	allModels := h.Models()
  

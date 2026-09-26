@@ -6,7 +6,33 @@
 
 | 补丁 | 上游基线 | 文件数 | 校验状态 |
 |---|---|---|---|
-| `cpa-whitelist.patch` | `router-for-me/CLIProxyAPI` **v7.2.159** | 22（白名单 14 + 消息归一化 2 + 流式收尾修复 2 + GPT-6 自动身份头 4） | 干净 v7.2.159 worktree 上 `git apply --check`（plain，无需 `--3way`）+ 重放 `go build ./...` 退出码 0 + `-run GPT6` 8 例全过；原基线 v7.2.157 下曾 `go vet` + `go test -race` 全通过 |
+| `cpa-whitelist.patch` | `router-for-me/CLIProxyAPI` **v7.3.18** | 30（白名单 14 + 消息归一化 2 + 流式收尾修复 2 + GPT-6 自动身份头 4 + **思考档位默认值 3** + **api-key-models 管理端点 2** + **config.yaml prune 1 + 测试 2**） | 干净 v7.3.18 worktree 上 `git apply --check`（plain，无需 `--3way`，无空白告警）+ 30/30 文件逐字节一致 + `go build ./...` 退出码 0 + `go test ./...` 97 包全过 + 沙箱灰度 23/23 |
+| `cpamp-whitelist.patch` | `seakee/CPA-Manager-Plus` **v1.14.1** | 9（2 个新文件：`apiKeyModels.ts` + 其测试） | 干净 v1.14.1 worktree 上 `git apply --check`（plain）+ 9/9 文件逐字节一致 + `tsc --noEmit` + `vitest`(4174) + 仓库级测试(257) + `vite build` 全通过 |
+
+> ### 2026-09-26 升级基线 **CPA v7.2.159 → v7.3.18** + **CPAMP v1.12.5 → v1.14.1**（616 个上游提交）
+>
+> 触发：pi-web 侧选「max」思考强度经 CPA 后变成 `high`。上游 v7.3.18 **未修复**该问题
+> （`config.example.yaml` 明确把它写成预期行为：未声明 `thinking:` 的模型默认注入
+> `[low,medium,high]`，超出档位夹到 high）；因此修复做进本补丁，并把 CPA/CPAMP 一并升到最新。
+>
+> **本次补丁新增：**
+> 1. **思考档位默认值修复**（`sdk/cliproxy/service_models.go`、`sdk/cliproxy/auth/api_key_model_capabilities.go`）：默认注入档位由 `[low,medium,high]` 扩为 `[low,medium,high,xhigh,max]`，客户端显式发送的 `max`/`xhigh` 原样透传；模型显式声明的 `thinking.levels` 仍然优先。沙箱实测 `max→max`、`xhigh→xhigh`，`high/medium/low` 不变。
+> 2. **`/v0/management/api-key-models` 管理端点**（GET/PUT/PATCH/DELETE）：面板可以把「加 key」与「配白名单」都走管理 API 一步落盘，不再整份重写 `config.yaml`（对齐上游 v1.14.1 对 `api-keys` 的新架构）。PATCH 是声明式幂等语义：非空列表=设置，空列表=取消限制。
+> 3. **`config.yaml` prune 修复**：上游 `SaveConfigPreserveComments` 只对白名单里的 mapping 做 prune（`oauth-excluded-models` 等），**未列入的 mapping 会保留原文件里的旧键**——因此通过管理端点**删除**一条 `api-key-models` 只会改内存、文件里那一条会留下来，并在下次 reload 复活。新增 `pruneMappingToGeneratedKeys(..., "api-key-models")` 一行修复，并补 2 例回归测试（去掉修复即失败，已验证）。
+>
+> **CPAMP 补丁本次是重写而非平移**：上游 v1.14.1 把 API key 的增删改整体改成「管理端点即时落盘」
+> （`onPersistApiKeyMutation` + `apiKeysApi`，并有 source-dirty 守卫、canonical 回读、快照刷新），
+> 旧补丁依赖的「可视化配置一步提交（`onRequestCommit` / `commitVisualChangesNow`）」在新架构里已不成立。
+> 现在白名单走 CPA 侧新端点，因此 **`VisualConfigEditor.tsx`、`ConfigPage.tsx`、`useVisualConfig.ts`、
+> `types/visualConfig.ts` 四个文件不再需要改动**，`api-key-models` 也不进入可视化值（整份保存时
+> 作为未知键原样保留），补丁面反而更小。
+>
+> 同时修掉一个上游 v1.14.1 的行为缺口：改动前的「编辑已有 key（未改名）」分支是**纯别名**流程，
+> 白名单改动会被它的 early-return 丢掉；且该分支要求别名非空，没有别名的 key 根本存不了。
+> 现在先做别名校验（仅在别名变更时）、再持久化白名单，别名未变时也照常落盘并提示。
+>
+> ⚠️ **v7.3.18 上游自带一个失败测试**：`TestOpenAICompatExecutorToolResultContentByInputModalities`（4 个子用例）在**未打补丁的干净基线**上同样失败（上一轮基线 v7.2.159 起就如此，属上游测试与实现不同步），**非本补丁引入**，本项目不代为修复。
+
 
 > 2026-09-13 升级基线 **v7.2.157 → v7.2.159**（补丁内容未变，仅基线前移）。新基线下实测：`git apply` plain 成功、18 文件、`go build ./...` 退出码 0；干净 v7.2.159 worktree 重放同样通过。上游 v7.2.157→v7.2.159 的 152 个改动文件中**仅 2 个**与本补丁重叠（`internal/api/server_management.go` 新增插件配额路由、`sdk/api/handlers/openai/openai_handlers.go` 改用 `h.WriteModelListResponse`），**均可自动合并**（白名单过滤分支与上游新 API 共存）。旧基线补丁存为 `cpa-whitelist.patch.bak-pre-v72159`。
 >
@@ -21,9 +47,12 @@
 > ⚠️ **norm2 曾漏出补丁**：该修复部署于 2026-08-30，但直到 2026-09-11 才补进 `cpa-whitelist.patch`（旧补丁 16 文件、`grep openai_compat_executor` = 0）。期间任何按旧流程重放补丁再构建镜像的操作都会**静默丢掉 norm2**。旧补丁存为 `cpa-whitelist.patch.bak-16file-pre-upgrade-v72157` 留作教训对照。
 >
 > 2026-09-14 补丁再新增 **GPT-6 家族自动 Codex 身份头**（4 文件：`codex_executor_request.go` 新增 `isGPT6FamilyModel` / `isOfficialCodexBaseURL` / `hasOperatorHeader` / `applyGPT6CodexIdentityHeaders`，在 `codex_executor_execute.go`（流式 + `/responses/compact`）与 `codex_executor_stream.go` 调用；`gpt6_codex_identity_test.go` **新增** 8 例回归测试）。背景：anyrouter 这类转发站按 `Originator` 分流，`codex_exec` 身份可用、`codex-tui`（CPA 默认 cloaking 值）报 `400 invalid codex request`。此前靠每个 provider 手写 `headers` + 关 `disable-codex-cloaking` 解决，装到别人机器上容易漏配。自动规则只在**非官方上游**（`base-url` 不含 `chatgpt.com` / `openai.com`）生效，且让位于 provider `headers` 与 `models.json` 的 `config.override_header`。18→22 文件，验证：干净 v7.2.159 worktree `git apply --check` plain 通过 + `go build ./...` 0 + `-run GPT6` 8 例 PASS（上游自带的 `TestOpenAICompatExecutorToolResultContentByInputModalities` 失败已用 0 改动干净 worktree 对照确认，非本补丁引入）。
-| `cpamp-whitelist.patch` | `seakee/CPA-Manager-Plus` **v1.12.5** | 9（含 1 个测试文件） | `git apply --check` + `tsc --noEmit` + `vitest`(2533) + `vite build` 全通过 |
+| `cpamp-whitelist.patch` | `seakee/CPA-Manager-Plus` **v1.14.1** | 9（2 个新文件） | 干净 v1.14.1 worktree 上 `git apply --check`（plain）+ 9/9 逐字节一致 + `tsc --noEmit` + `vitest`(4174) + 仓库级测试(257) + `vite build` |
 
-> ⚠️ **CPAMP 基线仍是 v1.12.5**（生产未升级到 v1.12.6）。升级到 v1.12.6 时本补丁需要重放，见文末。
+> ⚠️ **补丁基线已前移到 CPA v7.3.18 / CPAMP v1.14.1**（2026-09-26）。旧基线补丁分别留作
+> `cpa-whitelist.patch.bak-pre-v7318`（v7.2.159 基线，22 文件）与 `cpamp-whitelist.patch.bak-pre-v1141`
+> （v1.12.5 基线，9 文件）。升级时上游 v7.2.159→v7.3.18 与 CPAMP v1.12.5→v1.14.1 的改动里，
+> CPA 侧与本补丁重叠的 3 个 codex 文件需要手工合并（已合并并在下方「文件」表反映）；CPAMP 侧按新架构重写。
 
 ## 升级上游时的重放步骤
 
@@ -72,13 +101,17 @@ git diff HEAD > ../../patches/<name>.patch
 生成后**必须跑下面的完整性校验**，能编译且文件数符合预期才算补丁完整：
 
 ```bash
-# 1) 文件数应等于预期（CPA 当前 22）
-grep -c '^diff --git' ../../patches/cpa-whitelist.patch
+# 1) 文件数应等于预期（CPA 当前 30 / CPAMP 当前 9）
+grep -c '^diff --git' ../../patches/cpa-whitelist.patch     # 期望 30
+grep -c '^diff --git' ../../patches/cpamp-whitelist.patch   # 期望 9
 
-# 2) 关键修复不得缺失（norm1 / norm2 / gpt6 各自的存在性）
-grep -c normalizeOpenAIChatMessages ../../patches/cpa-whitelist.patch   # 期望 >= 1
-grep -c synthesizeOpenAIStreamFinish ../../patches/cpa-whitelist.patch  # 期望 >= 1
-grep -c applyGPT6CodexIdentityHeaders ../../patches/cpa-whitelist.patch # 期望 >= 1
+# 2) 关键修复不得缺失（白名单 / norm1 / norm2 / gpt6 / 思考档位 / 新端点 / prune）
+grep -c normalizeOpenAIChatMessages ../../patches/cpa-whitelist.patch      # 期望 >= 1
+grep -c synthesizeOpenAIStreamFinish ../../patches/cpa-whitelist.patch     # 期望 >= 1
+grep -c applyGPT6CodexIdentityHeaders ../../patches/cpa-whitelist.patch    # 期望 >= 1
+grep -c GetAPIKeyModels ../../patches/cpa-whitelist.patch                  # 期望 >= 1
+grep -c 'pruneMappingToGeneratedKeys.*api-key-models' ../../patches/cpa-whitelist.patch  # 期望 >= 1
+grep -c apiKeyModelsApi ../../patches/cpamp-whitelist.patch                # 期望 >= 1
 
 # 3) 在干净的目标 tag 上真实回放一次（最能发现问题）
 git worktree add /tmp/patchcheck --detach v<目标版本>
@@ -88,6 +121,7 @@ cd /tmp/patchcheck && git apply --check ../../patches/cpa-whitelist.patch \
 
 > 经验：只做 `git apply --check` 不够——它只验证补丁能贴上，**不验证补丁内容是否完整**。
 > 补丁漏文件时 `apply --check` 照样通过。必须加上「文件数 + 关键字 + 能编译」三重校验。
+> 另：回放后建议再逐文件 `cmp` 与工作树对比（本次升级就是这么做的：30/30 与 9/9 逐字节一致）。
 
 ## cpa-whitelist.patch（CPA 后端）
 
@@ -103,7 +137,15 @@ cd /tmp/patchcheck && git apply --check ../../patches/cpa-whitelist.patch \
 | `sdk/api/handlers/handlers_stream.go` | 流式执行前调 `enforceModelWhitelist` |
 | `sdk/api/handlers/openai/openai_handlers.go` | `GET /v1/models` 按白名单过滤，受限 key 只看到自己的模型 |
 | `internal/api/handlers/management/models.go` | **新增**：`GET /v0/management/models` 返回**全量**模型目录（不受白名单影响） |
-| `internal/api/server_management.go` | 注册上述 management 路由 |
+| `internal/api/handlers/management/config_api_key_models.go` | **新增（v7.3.18）**：`GET/PUT/PATCH/DELETE /v0/management/api-key-models` —— 白名单的读/整表替换/单条声明式同步/单条删除；统一 trim+去重、空列表视为「无限制」（不写空映射），每次变更走 `h.persist` 触发同一条 reload 链路 |
+| `internal/api/handlers/management/config_api_key_models_test.go` | **新增（v7.3.18）**：10 例（GET 空对象 / PATCH trim+去重+落盘 / 空列表删除 / 未知 key 幂等 / 缺 key 400 / PUT 整表替换与拖尾丢弃 / DELETE 未知 404 / 中文模型名原样往返） |
+| `internal/config/config_yaml.go` | **prune 修复（v7.3.18）**：`SaveConfigPreserveComments` 的 prune 列表补上 `api-key-models`（上游原本只 prune `oauth-excluded-models` / `oauth-model-alias` / `oauth-request-scoped-errors`）——否则经管理端点删除的白名单条目只改内存，文件里的旧键会在下次 reload 复活 |
+| `internal/config/config_api_key_models_save_test.go` | **新增（v7.3.18）**：2 例（删除条目后文件里真的消失、清空后整个映射消失）；**去掉修复即失败**已验证 |
+| `sdk/cliproxy/service_models.go` | **思考档位默认值（v7.3.18）**：`buildOpenAICompatibilityConfigModels` 未声明 `thinking:` 时注入的默认档位由 `[low,medium,high]` 扩为 `[low,medium,high,xhigh,max]` |
+| `sdk/cliproxy/auth/api_key_model_capabilities.go` | **同上**：`compileOpenAICompatibleModelCapabilities` 同一个默认档位表 |
+| `sdk/cliproxy/openai_compat_thinking_defaults_test.go` | **新增（v7.3.18）**：默认档位含 max/xhigh + 模型显式 `thinking.levels` 仍优先 |
+| `sdk/cliproxy/auth/openai_compat_thinking_defaults_test.go` | **新增（v7.3.18）**：能力编译路径同上断言 |
+| `internal/api/server_management.go` | 注册上述 management 路由（`/models` + `/api-key-models` 四方法） |
 | `sdk/api/handlers/handlers_model_whitelist_test.go` | **新增**：403 拦截回归测试（放行/拒绝/不受限/空白名单/nil 边界） |
 | `sdk/api/handlers/openai/openai_models_whitelist_test.go` | **新增**：`/v1/models` 过滤回归测试 |
 | `internal/api/handlers/management/models_test.go` | **新增**：全量端点不受白名单影响 + 字段投影测试 |
@@ -128,43 +170,56 @@ cd /tmp/patchcheck && git apply --check ../../patches/cpa-whitelist.patch \
 
 ## cpamp-whitelist.patch（CPAMP 前端）
 
+基线 **v1.14.1**。9 个文件，其中 2 个是新增。
+
 | 文件 | 改动 |
 |---|---|
-| `apps/web/src/types/visualConfig.ts` | 新增 `apiKeyModelsText` 字段 |
-| `apps/web/src/hooks/useVisualConfig.ts` | `api-key-models` 的解析与序列化（`key=m1,m2` 行格式） |
-| `apps/web/src/components/config/ApiKeysCardEditor.tsx` | 模型白名单多选（搜索/全选/清空）；候选改走 management 端点并带回退提示；保存后请求一步落盘 |
-| `apps/web/src/components/config/VisualConfigEditor.tsx` | 透传 `modelsText` 与 `onRequestCommit` |
-| `apps/web/src/features/config/ConfigPage.tsx` | `commitVisualChangesNow`：跳过 diff 预览直接写 `config.yaml` 并回读刷新基线 |
-| `apps/web/src/hooks/useVisualConfigApiKeyWhitelist.test.ts` | **新增**：白名单 YAML 往返 / 一步写入 / 清空删除 / 畸形行忽略 共 5 例 |
-| `apps/web/src/i18n/locales/{en,zh-CN,zh-TW}.json` | 白名单与提示文案（zh-TW 已补齐此前缺失的 11 个 key） |
+| `apps/web/src/services/api/apiKeyModels.ts` | **新增**：`apiKeyModelsApi` —— `list()`（读白名单映射，严格校验响应形状）、`setForKey(key, models)`（声明式 PATCH，空列表=取消限制）、`deleteForKey(key)`、`listModelCatalogue()`（走 `GET /v0/management/models` 拿**全量**目录）、`probeClientModels(key)`（回退探 `/v1/models`，调用方需标注「列表可能不完整」） |
+| `apps/web/src/services/api/apiKeyModels.test.ts` | **新增**：10 例（空/驼峰字段/缺字段/非数组拒绝 / trim 与空条目丢弃 / PATCH 载荷 / 空列表走 PATCH 而非 DELETE / key URL 编码 / 全量目录去重投影 / 畸形载荷空列表） |
+| `apps/web/src/services/api/index.ts` | 导出新服务 |
+| `apps/web/src/components/config/ApiKeysCardEditor.tsx` | 模型白名单多选 UI（搜索 / 全选可见 / 清空 / 计数 / 加载按钮）；挂载时读白名单映射并在编辑弹窗预勾选；保存时紧接 `onPersistApiKeyMutation` 之后持久化白名单（改名时同步丢弃旧 key 条目），失败则是「key 已存但白名单未存」的 partial-success 告警；删除 key 后同步清理其白名单条目；候选列表优先 management 全量端点，回退探针并提示不完整 |
+| `apps/web/src/components/config/ApiKeysCardEditor.test.tsx` | 在既有 31 例之外新增 8 例（预勾选 / 一步保存 / 清空 / 改名迁移 / 删除清理 / partial success / 回退提示 / 别名未变时不误写） |
+| `apps/web/src/i18n/locales/{en,zh-CN,zh-TW,ru}.json` | 白名单与提示文案 14 个 key（**四个 locale 键集完全一致**，有 `ConfigPage.test.ts` 守卫） |
 
-### 一步保存
+> **与旧版（v1.12.5 基线）补丁的区别**：旧版依赖「可视化配置一步提交」链（`types/visualConfig.ts` 的
+> `apiKeyModelsText`、`useVisualConfig.ts` 的解析/序列化、`VisualConfigEditor.tsx` 的 props 透传、
+> `ConfigPage.tsx` 的 `commitVisualChangesNow`，以及 `useVisualConfigApiKeyWhitelist.test.ts`），
+> 上游 v1.14.1 把 API key 改成管理端点即时落盘后这条链已不成立——现在白名单自己走
+> `/v0/management/api-key-models`，**上述 5 个文件不再需要改动**，补丁面更小、与上游的耦合也更低。
 
-在 API Key 弹窗里加 key + 勾模型，点弹窗「保存」即写入 `config.yaml` 并生效，
-不需要再去点配置页顶部的「保存配置」。实现方式：弹窗保存后回调
-`onRequestCommit()`，`ConfigPage` 在同一个 effect 里（此时 visual state 已提交）
-执行 `fetchConfigYaml → applyVisualChangesToYaml → saveConfigYaml → 回读`，
-并用 ref 防止重入。
+### 一步保存（F-04）
 
-副作用需知：这一步会连同配置页上**其它已改未保存**的可视化字段一起落盘
-（与顶部「保存」的语义一致）。
+在 API Key 弹窗里加 key + 勾模型，点弹窗「保存」即可：`api-keys` 走上游自己的
+`onPersistApiKeyMutation`（管理端点），`api-key-models` 紧跟着走 CPA 新端点，两者都是即时落盘，
+不需要再点配置页顶部的「保存配置」。
 
-## 升级 CPAMP 到 v1.12.6 的注意事项
+⚠️ **顺序要求**：CPA 必须先升到带 `/v0/management/api-key-models` 的版本（本补丁 v7.3.18），
+否则面板侧的读/写会 404。部署时先切 CPA、再切 CPAMP。
 
-v1.12.6 改动了本补丁触及的 `ConfigPage.tsx` 与三个 locale 文件。实测：
-`git apply` 直接打会在 locale 上报错，`--3way` 可干净应用，`tsc` 与 `vite build` 均通过。
-当前补丁已消除「文件末尾换行」这一伪冲突源，重放阻力比早期小。
+## 升级 CPAMP 的注意事项（v1.12.5 → v1.14.1 实测）
 
-但 v1.12.6 会把 legacy 的 `CPA_UPSTREAM_URL` + `CPA_MANAGEMENT_KEY_FILE` 迁移进加密
-SQLite，且带 fail-closed 逻辑，升级前必须把 `usage.sqlite` + `-wal` + `-shm` + `data.key`
-当**一整套文件集**备份。
+v1.12.5 → v1.14.1 跨了 616 个上游提交，本补丁触及的 `ApiKeysCardEditor.tsx` 被上游大改
+（+408/-137，改成管理端点即时落盘），四个 locale 文件也都有改动。实测：`git apply --3way`
+在 `ApiKeysCardEditor.tsx` 上有 7 个冲突块，其余文件可自动合并；本次是按新架构重写该文件。
+
+迁移风险已实测可控：v1.12.6+ 会把 legacy 的 `CPA_UPSTREAM_URL` + `CPA_MANAGEMENT_KEY_FILE`
+迁移进加密 SQLite，且 fail-closed。**升级前必须把 `usage.sqlite` + `-wal` + `-shm` + `data.key`
+当一整套文件集备份**；本次用「卷副本起 canary」的方式在生产前先跑通迁移（实测：迁移与派生表
+重建全部完成，无报错）。
+
+另有一个已观察到的安全行为：两个 CPAMP 实例指向同一 `usage.sqlite` 时，后启动的那个会
+以 `manager database process lock is already held` 退出（`Exited (1)`）——这是有意的进程锁，
+不是缺陷；起 canary 时请各用一份数据副本。
 
 ## 备份位置
 
-- `src/cli-proxy-api/` — **v7.2.159** + 本补丁（22 文件），与生产构建逐文件一致
-- `src/cpa-manager-plus/` — v1.12.5 + 本补丁，与生产构建逐文件一致
+- `src/cli-proxy-api/` — **v7.3.18** + 本补丁（30 文件），与生产构建逐文件一致
+- `src/cpa-manager-plus/` — **v1.14.1** + 本补丁（9 文件），与生产构建逐文件一致
 - `src/backup/cpa-src-whitelist-full-v7.2.145-norm2.tar.gz` — 升级前 v7.2.145 完整源码（含白名单+norm1+norm2，历史锚点）
 - `src/backup/cpa-src-whitelist-full-v7.2.143.tar.gz` — 生产镜像 `:whitelist` 的原始完整源码（更早锚点）
+- `patches/cpa-whitelist.patch.bak-pre-v7318` — v7.2.159 基线版补丁（22 文件，包括 thinking/api-key-models/prune 三组新改动之前的状态）
+- `patches/cpa-whitelist.patch.bak-26file-pre-apikeymodels` — 本次升级中途态：已是 v7.3.18 基线 26 文件、但还没加 api-key-models 端点与 prune 修复
+- `patches/cpamp-whitelist.patch.bak-pre-v1141` — v1.12.5 基线版前端补丁（9 文件，旧的可视化配置一步提交架构）
 - `patches/cpa-whitelist.patch.bak-pre-v72159` — v7.2.157 基线版补丁（基线迁移前，内容等价但上下文对齐旧 tag）
 - `patches/cpa-whitelist.patch.bak-16file-pre-upgrade-v72157` — 缺 norm2 的 16 文件旧补丁（教训对照）
 - `patches/cpa-whitelist.patch.bak-incomplete` — 更早的残缺补丁（教训对照）

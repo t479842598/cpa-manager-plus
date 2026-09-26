@@ -17,10 +17,12 @@
 
 | 服务 | 容器名 | 镜像 | 端口 |
 |---|---|---|---|
-| CPA | cli-proxy-api | eceasy/cli-proxy-api:whitelist-v7.2.159-norm2 | 127.0.0.1:8317 |
-| CPAMP | cpa-manager-plus | seakee/cpa-manager-plus:whitelist-v3 | 127.0.0.1:18317 |
+| CPA | cli-proxy-api | eceasy/cli-proxy-api:whitelist-v7.3.18-norm2-gpt6 | 127.0.0.1:8317 |
+| CPAMP | cpa-manager-plus | seakee/cpa-manager-plus:whitelist-v4 | 127.0.0.1:18317 |
 
-> 当前版本：**CPA v7.2.159 + 白名单 + 消息归一化（norm1）+ 流式收尾修复（norm2）**（2026-09-13 由 v7.2.157 升级，含 35 个上游提交；详见下方时间线）+ **CPAMP v1.12.5-whitelist-v3**（上游基线仍 v1.12.5，**有意不升**；实测 v1.12.12 补丁有 16 个冲突块且 v1.12.6 加密迁移带 fail-closed，原因见「升级 CPAMP 到 v1.12.6」）。旧镜像 `:whitelist-v7.2.157-norm2` / `:whitelist-v7.2.145-norm2` / `:whitelist-v7.2.145-norm1` / `:whitelist-v7.2.145` / `:whitelist` / `:latest` 全部保留作回滚锚点。
+> 当前版本：**CPA v7.3.18 + 白名单 + 消息归一化（norm1）+ 流式收尾修复（norm2）+ GPT-6 自动身份头（gpt6）+ 思考档位默认值修复 + api-key-models 管理端点**（2026-09-26 升级）
+> + **CPAMP v1.14.1-whitelist-v4**（2026-09-26 升级，白名单改走管理端点即时落盘）。
+> 旧镜像 `:whitelist-v7.2.159-norm2-gpt6` / `:whitelist-v7.2.159-norm2` / `:whitelist-v7.2.157-norm2` / `:whitelist-v7.2.145-norm2` / `:whitelist-v7.2.145-norm1` / `:whitelist-v7.2.145` / `:whitelist` / `:latest` 与 CPAMP `:whitelist-v3` / `:whitelist-v2` / `:whitelist` / `:latest` 全部保留作回滚锚点。
 
 部署目录：`/opt/cpa/`（`compose.yaml`、`cli-config.yaml`、`secrets/`）
 
@@ -569,6 +571,113 @@ cd /opt/cpa && docker compose restart cli-proxy-api
 ```
 
 > ⚠️ **自定义资产**：该值在宿主机挂载文件里、**不在镜像内**。换机 / 重建 `/opt/cpa` / 从旧备份还原配置时**必须重新应用**（上游默认值不等于 2s）；否则「一次上游抖动 → 连续 503」的问题会复现。
+
+### 2026-09-26 升级 CPA v7.3.18 + CPAMP v1.14.1（`whitelist-v7.3.18-norm2-gpt6` / `whitelist-v4`）
+
+**触发**：pi-web 侧选「max」思考强度，经 CPA 到上游后变成 `high`（usage 库记录为 `high`）。
+目标是核实「升级能否解决」并把两个上游都升到最新。
+
+**结论（一手证据）**：**上游 v7.3.18 未修复该问题**。在 `/tmp/cpa-wt-7318`（干净 v7.3.18）复现：
+`sent=max -> upstream=high` 仍成立；`validate.go` / `convert.go` 从 v7.2.159 到 v7.3.18 **逐字节未变**，
+两处默认档位硬编码仍在；`config.example.yaml` 把行为写成预期（未声明 `thinking:` → 默认
+`[low,medium,high]`，超出档位夹到 high）。因此修复做进本补丁（默认档位扩为
+`[low,medium,high,xhigh,max]`），并按用户要求升级两个上游、重打包全部自定义资产。
+
+**升级前验证（隔离 worktree，零污染）**：
+
+- CPA：v7.3.18 上 `git apply --3way`，3 个 codex 文件与上游改动重叠并手工合并（上游新增
+  `applyCodexRoutingHint` 与我们的 `applyGPT6CodexIdentityHeaders` 共存），其余干净；单测补
+  思考档位 2 套 + api-key-models 端点 10 例 + prune 2 例
+- CPAMP：v1.14.1 上 `ApiKeysCardEditor.tsx` 有 7 个冲突块（上游 +408/-137 改成管理端点即时落盘），
+  按新架构重写；`VisualConfigEditor.tsx` / `ConfigPage.tsx` / `useVisualConfig.ts` / `types/visualConfig.ts`
+  **不再需要改动**
+
+**灰度期间发现并修复的两个真实缺陷（关键）**：
+
+1. **白名单条目删不掉**：用配置副本起的沙箱（8319）出现「PATCH 空列表返回 200、内存已删、
+   **文件里还在**、且 3 秒后依旧」。根因是上游 `SaveConfigPreserveComments` 只对写死的 mapping
+   做 prune（`oauth-excluded-models` 等），未列入的 mapping 会保留原文件旧键 → 补
+   `pruneMappingToGeneratedKeys(..., "api-key-models")`，并补 2 例回归测试（**去掉修复即失败**已验证）。
+2. **编辑已有 key 时白名单改动被丢弃**：上游 v1.14.1 的「key 未改名」分支是纯别名流程且 early-return，
+   且要求别名非空（没别名的 key 存不了）→ 面板侧改为「仅在别名变更时校验 + 白名单持久化前置」。
+
+**备份**：`/opt/cpa/backups/upgrade-v7.3.18-cpamp-v1.14.1-20260926T093448Z/`
+- 含 `cpamp-volume.tar.gz`（67 MB：`usage.sqlite` 522 MB + `data.key` 44 B + `usage-imports/`）、
+  `cli-config.yaml`、`compose.yaml`、`secrets/`、`data/`、`MANIFEST.txt`（全文件 sha256）
+- 校验：`integrity_check = ok`、`quick_check = ok`、46 张表、`usage_events` **83131** 行；
+  停容器后卷内 `-wal` / `-shm` 已不存在（正常现象，非备份遗漏）
+- 异地副本：`backup-remote/upgrade-v7.3.18-cpamp-v1.14.1-20260926T093448Z/`，5 个文件 sha256
+  与服务器 MANIFEST **逐字节一致**
+- ⚠️ 含明文密钥与 `data.key`，**不得纳入 git 或对外分享**（已由根目录 `.gitignore` 排除）
+
+**构建**（服务器，原生 arm64；源码包 `cpa7318build.tar.gz` / `cpamp1141build.tar.gz`）：
+```bash
+cd /tmp/cpa7318build
+docker build --build-arg VERSION=v7.3.18 --build-arg COMMIT=ed980be3 \
+  --build-arg BUILD_DATE=2026-09-26T10:10:00Z \
+  -t eceasy/cli-proxy-api:whitelist-v7.3.18-norm2-gpt6 .
+# → daf220703bda（Go CGO 构建 143s）
+
+cd /tmp/cpamp1141build
+docker build -f Dockerfile.manager-server --build-arg VERSION=v1.14.1 \
+  --build-arg SOURCE_COMMIT=aa8c5e98 -t seakee/cpa-manager-plus:whitelist-v4 .
+# → fef8b46b8956
+```
+启动日志确认：`CLIProxyAPI Version: v7.3.18, Commit: ed980be3`。
+
+**灰度（三层，均在生产前完成）**：
+
+| 层 | 端口 | 内容 | 结果 |
+|---|---|---|---|
+| 生产配置只读 canary | 8318 | 用生产 `cli-config.yaml`（不写入）；版本/模型数/白名单 403/管理端点鉴权 | **7/8**（1 项不适用：生产 5 个 key 全受限，无「不受限 key」可测） |
+| 配置副本沙箱 | 8319 | 配置副本 + 本地 echo 上游（故意不声明 `thinking:`）；验证思考档位透传与白名单写/删/落盘/热重载/复原 | **23/23** |
+| CPAMP 卷副本 canary | 18318 / 18319 | 卷副本跑迁移；18319 指向新 CPA 验证「面板→代理→新端点」 | 启动无 fail-closed、迁移完成；代理到新端点 **200** |
+
+沙箱里最有价值的三条结果：
+
+- `reasoning_effort` **max → 上游收到 `max`**、xhigh → `xhigh`，`high/medium/low` 不变（原 bug 的直接反证）
+- PATCH 空列表删除后**条目从 `config.yaml` 消失**（prune 修复生效），内存与文件一致，删除后该 key 恢复不受限
+- 写入后立即 403 越权拦截（说明 reload → access provider 重建链路对白名单同样即时生效）
+
+**切换（先 CPA 后 CPAMP —— 面板新端点依赖 CPA 侧存在）**：
+```bash
+cd /opt/cpa
+cp compose.yaml compose.yaml.bak-pre-v7.3.18
+sed -i 's|whitelist-v7.2.159-norm2-gpt6|whitelist-v7.3.18-norm2-gpt6|' compose.yaml
+docker compose up -d --no-deps cli-proxy-api
+
+cp compose.yaml compose.yaml.bak-pre-cpamp-v1.14.1
+sed -i 's|seakee/cpa-manager-plus:whitelist-v3|seakee/cpa-manager-plus:whitelist-v4|' compose.yaml
+docker compose up -d --no-deps cpa-manager-plus
+docker rm -f cpa-canary cpamp-canary cpamp-canary2 cpa-sandbox  # 清灰度容器
+```
+
+**生产复测（全过）**：
+
+| 验证项 | 期望 | 实测 |
+|---|---|---|
+| CPA 版本 / 客户端 | v7.3.18 / 22 | v7.3.18 ed980be3 / 21 OpenAI-compat + 1 Codex |
+| `/v0/management/api-key-models` 带 key | 200 | **200**（5 条，与 config 一致） |
+| 同端点无 key | 401 | **401** |
+| `/v0/management/models` | 200 全量 | 200 / **93** |
+| 白名单外模型 | 403 | **403 `model_not_allowed`** |
+| 公网 `api.274747.xyz` | — | `/v1/models` 200、越权 403、面板 `/health` 200 |
+| **思考档位（原 bug）** | max 记 max | usage 库：`buddy/deepseek-v4.1-flash` **effort=max / xhigh**（修复前均为 high） |
+| 白名单写路径（可逆） | 追加→生效→复原 | 追加落盘且放行；复原后文件/内存与初始一致、越权重新 403；生产配置零残留 |
+| CPAMP 迁移 | 完成无报错 | 迁移 + 派生表重建（83k 事件）完成；`/health` 200；面板含新白名单 UI |
+| 日志 | 0 panic/fatal | CPA 0 / CPAMP 0 |
+
+**旧镜像回滚锚点**：`eceasy/cli-proxy-api:whitelist-v7.2.159-norm2-gpt6`、`seakee/cpa-manager-plus:whitelist-v3`（均保留）。
+
+**自定义配置未动**：`api-key-models` / `payload.default` / `routing.session-affinity` / `codex.disable-codex-cloaking` / `transient-error-cooldown-seconds: 2` 全部随 `/opt/cpa/cli-config.yaml` 保留。
+
+**补丁基线迁移**：CPA `v7.2.159 → v7.3.18`（22 → **30 文件**，旧补丁存 `cpa-whitelist.patch.bak-pre-v7318`）；
+CPAMP `v1.12.5 → v1.14.1`（**9 文件**，旧补丁存 `cpamp-whitelist.patch.bak-pre-v1141`）。两个补丁均在干净 tag 上
+plain `git apply --check` + 逐文件 `cmp` 一致（30/30、9/9）+ `go build` / `tsc` / `vitest` / `vite build` 通过。
+
+**另一个已观察到的安全行为（起 canary 时必知）**：两个 CPAMP 实例指向同一 `usage.sqlite` 时，
+后启动的会以 `manager database process lock is already held` 退出（`Exited (1)`）——这是有意的进程锁，
+不是缺陷；起 canary 请各用一份数据副本。
 
 ### 回滚
 

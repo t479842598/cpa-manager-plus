@@ -2,8 +2,8 @@
 
 LLM API 聚合网关部署与维护项目。
 
-- **CPA (CLIProxyAPI)**：LLM API 聚合代理网关（端口 8317）——当前 **v7.2.159 + 白名单 + 消息归一化 + 流式收尾修复（whitelist-v7.2.159-norm2）**
-- **CPAMP (CPA-Manager-Plus)**：CPA 管理面板 + 可观测仪表盘（端口 18317）——当前 **v1.12.5-whitelist-v3**（上游基线 v1.12.5，有意不升 v1.12.6）
+- **CPA (CLIProxyAPI)**：LLM API 聚合代理网关（端口 8317）——当前 **v7.3.18 + 白名单 + 消息归一化(norm1) + 流式收尾修复(norm2) + GPT-6 自动身份头 + 思考档位默认值修复（whitelist-v7.3.18-norm2-gpt6）**
+- **CPAMP (CPA-Manager-Plus)**：CPA 管理面板 + 可观测仪表盘（端口 18317）——当前 **v1.14.1-whitelist-v4**
 - **域名**：https://api.274747.xyz
 - **服务器**：Oracle 193.123.167.208（Ubuntu 24.04 ARM64 / 2H12G）
 
@@ -13,13 +13,13 @@ LLM API 聚合网关部署与维护项目。
 cpa-manager-plus/
 ├── README.md                 # 本文件
 ├── src/
-│   ├── cli-proxy-api/        # CPA 源码（v7.2.159 + 白名单补丁，与生产构建逐文件一致）
-│   ├── cpa-manager-plus/     # CPAMP 源码（v1.12.5 + 白名单补丁，与生产构建逐文件一致）
+│   ├── cli-proxy-api/        # CPA 源码（v7.3.18 + 白名单补丁，与生产构建逐文件一致）
+│   ├── cpa-manager-plus/     # CPAMP 源码（v1.14.1 + 白名单补丁，与生产构建逐文件一致）
 │   └── backup/               # 生产镜像原始完整源码归档（历史锚点）
 ├── patches/
 │   ├── README.md             # ⚠️ 重放/重导出补丁必读（含踩坑说明）
-│   ├── cpa-whitelist.patch   # CPA 补丁（22 文件 = 白名单 14 + 归一化 2 + 收尾修复 2 + GPT-6 自动身份头 4）
-│   └── cpamp-whitelist.patch # CPAMP 白名单补丁（9 文件）
+│   ├── cpa-whitelist.patch   # CPA 补丁（30 文件 = 白名单 14 + 归一化 2 + 收尾修复 2 + GPT-6 身份头 4 + 思考档位 3 + api-key-models 端点 2 + prune 1 + 测试 2）
+│   └── cpamp-whitelist.patch # CPAMP 白名单补丁（9 文件，其中 2 个新增）
 ├── backup-remote/            # 服务器备份的异地副本
 └── docs/
     └── deployment.md         # 部署与运维记录（含升级/回滚/备份路径）
@@ -75,8 +75,9 @@ ZCode 报 `Model request failed`（`/v1/responses` + 长输出）的根因在 CP
 - **CPA 后端**：config 新增 `api-key-models` 映射字段（`{key: [模型列表]}`），认证时把白名单挂到请求 context，模型路由前检查，不在白名单返回 `403 model_not_allowed`
 - **`/v1/models` 同步过滤**：受限 key 只能看到自己白名单内的模型，「看得见」与「调得动」严格一致
 - **`GET /v0/management/models`**（新增）：management key 认证，返回**全量**模型目录且不受白名单影响，供面板列候选模型；经 CPAMP 现有通用透传可达，**无需改 nginx**
-- **CPAMP 前端**：API Key 弹窗内多选勾选模型（带搜索/全选/清空），候选来自全量端点；**加 key + 配白名单一步落盘**，无需再点顶部「保存配置」；删除 key 同样一步落盘并带危险操作确认
-- **回归测试**：CPA 10 例 + CPAMP 5 例，覆盖 403 拦截、列表过滤、全量端点、YAML 往返与一步写入
+- **`/v0/management/api-key-models`**（新增，v7.3.18 起）：GET/PUT/PATCH/DELETE 四个方法，让面板把「加 key」与「配白名单」都走管理 API 即时落盘（PATCH 为声明式幂等：非空=设置、空=取消限制）；配套修复 `SaveConfigPreserveComments` 的 prune 列表，否则删除的条目会在下次 reload 复活
+- **CPAMP 前端**：API Key 弹窗内多选勾选模型（带搜索/全选/清空），候选来自全量端点；**加 key + 配白名单一步落盘**（两者都走管理端点，即时生效），无需再点顶部「保存配置」；编辑已有 key 时白名单改动同样落盘（上游 v1.14.1 的纯别名分支会丢弃它，已修）；删除 key 时连带清理白名单条目
+- **回归测试**：CPA 侧 14 例（403 拦截 / 列表过滤 / 全量端点 / 思考档位 / 白名单管理端点 / 落盘 prune）+ CPAMP 侧 18 例（服务契约 10 + 编辑器 8）
 
 ### 配置示例
 

@@ -8,7 +8,49 @@
 
 ---
 
-## 2026-09-16 — CPA 瞬态错误冷却 15s → 2s（配置变更，不动镜像；属自定义资产）
+## 2026-09-26 — 升级 CPA v7.3.18 + CPAMP v1.14.1，修复「思考强度 max 被夹成 high」（正式标签 `whitelist-v7.3.18-norm2-gpt6` / `whitelist-v4`，已部署生产）
+
+### 修复
+
+- **思考强度透传（本轮触发问题）**：pi-web 侧选「max」经 CPA 到上游后变成 `high`。根因：CPA 对未显式声明 `thinking:` 的 `openai-compatibility` 模型注入写死的默认档位 `[low,medium,high]`，客户端发来的 `xhigh`/`max` 被 `clampLevel` 夹到 `high`（两处硬编码：`buildOpenAICompatibilityConfigModels`、`compileOpenAICompatibleModelCapabilities`）。
+  - **上游 v7.3.18 未修复**（`config.example.yaml` 把它写成预期行为，只提供逐模型显式声明 `thinking.levels` 的迂回方式），因此修进本补丁：默认档位扩为 `[low,medium,high,xhigh,max]`，模型显式声明仍优先。
+  - 生产实测（usage 库）：`buddy/deepseek-v4.1-flash` 发 `max` → 记录 `max`；发 `xhigh` → 记录 `xhigh`；修复前这两个值均记录为 `high`。
+- **白名单条目删不掉（升级过程中发现的新 bug）**：上游 `SaveConfigPreserveComments` 只对写死的几个 mapping 做 prune（`oauth-excluded-models` / `oauth-model-alias` / `oauth-request-scoped-errors`），未列入的 mapping 会**保留原文件里的旧键**。因此经管理端点删除一条 `api-key-models` 只改内存、文件里那一条会留下并在下次 reload 复活。补一行 `pruneMappingToGeneratedKeys(..., "api-key-models")`，并补 2 例回归测试（去掉修复即失败，已验证）。
+- **编辑已有 key 时白名单改动会被丢弃**：上游 v1.14.1 的「key 未改名」分支是纯别名流程且 early-return；另外该分支要求别名非空，没有别名的 key 存不了。面板侧改为：别名仅在变更时校验，白名单持久化前置，别名未变也照常落盘并提示。
+
+### 新增
+
+- **CPA `GET/PUT/PATCH/DELETE /v0/management/api-key-models`**：把 per-key 白名单纳入管理 API（对齐上游对 `api-keys` 的新架构）。PATCH 是声明式幂等语义——非空列表=设置，空列表=取消限制；每次变更走 `h.persist` 触发既有 reload 链路，即时生效。
+- **CPAMP 白名单改为管理端点即时落盘**：新增 `apps/web/src/services/api/apiKeyModels.ts`，弹窗勾完模型点一次「保存」即同时落 `api-keys` 与 `api-key-models`；候选列表优先 `/v0/management/models` 全量目录，失败回退 `/v1/models` 探针并提示「列表可能不完整」。
+- 回归测试：CPA 侧 `internal/config` 2 例 + `management` 10 例 + 思考档位 4 例；CPAMP 侧新增 8 例 editor 用例 + 10 例服务用例（四个 locale 键集一致性由既有 `ConfigPage.test.ts` 守卫）。
+
+### 变更
+
+- **CPA 基线 v7.2.159 → v7.3.18**；补丁 22 → 30 文件。白名单 / norm1 / norm2 / gpt6 四组既有改动全部保留；上游改过的 3 个 codex 文件（`codex_executor_execute.go` / `codex_executor_request.go` / `codex_executor_stream.go`）已手工合并（上游新增的 `applyCodexRoutingHint` 与我们的 `applyGPT6CodexIdentityHeaders` 共存），并顺带修掉 `handlers.go` / `openai_handlers.go` / `apikey_metadata.go` 的 gofmt 问题。
+- **CPAMP 基线 v1.12.5 → v1.14.1**（跨 616 个上游提交），补丁按新架构重写：不再需要改 `VisualConfigEditor.tsx` / `ConfigPage.tsx` / `useVisualConfig.ts` / `types/visualConfig.ts`，`api-key-models` 不进入可视化值（整份保存时作为未知键原样保留），补丁面反而从 9 文件（含 4 个可视化层文件）缩到 9 文件（其中 2 个新文件）。
+- 镜像：CPA `whitelist-v7.3.18-norm2-gpt6`（ID `daf220703bda`）、CPAMP `whitelist-v4`（ID `fef8b46b8956`），均在服务器原生构建。旧镜像 `whitelist-v7.2.159-norm2-gpt6` / `whitelist-v3` 保留作回滚锚点。
+- 自定义配置（`/opt/cpa/cli-config.yaml`）零改动：`api-key-models`、`payload.default`、`routing.session-affinity`、`codex.disable-codex-cloaking`、`transient-error-cooldown-seconds: 2` 全部随文件保留。
+
+### 部署与验证
+
+- 全量备份 `/opt/cpa/backups/upgrade-v7.3.18-cpamp-v1.14.1-20260926T093448Z/`（卷含 `usage.sqlite` 522MB + `data.key` + `usage-imports/`，`integrity_check=ok`、46 表、`usage_events` 83131 行），异地副本已 scp 回 `backup-remote/` 且 5 个 sha256 与服务器逐字节一致。
+- 灰度（三层：生产配置只读 canary 8318 → 配置副本沙箱 8319 → 卷副本 CPAMP canary 18318/18319）：沙箱 **23/23 过**（含 `max→max`/`xhigh→xhigh` 透传、白名单写/删/落盘/prune、热重载生效、复原）；生产只读 7/8（1 项不适用：生产 5 个 key 全部受限，无「不受限 key」可测）；CPAMP 迁移在卷副本上跑通（83k 事件派生表重建完成，无报错）。
+- 切换顺序：**先 CPA 后 CPAMP**（面板的新端点依赖 CPA 侧存在）。已按灰度结果切换并向旧镜像留锚。
+- 生产复测：`/v1/models` 受限 key 28 个、越权 `403 model_not_allowed`、`GET /v0/management/api-key-models` 200 / 无 key 401、公网 HTTPS 三项通过、CPA/CPAMP 日志 panic/fatal **0**。
+- 白名单**写路径**在生产上做了可逆验证（追加→生效→复原）：追加后条目落盘且该模型放行，复原后文件与内存均与初始一致、越权重新 403；生产配置零残留（与写测试前逐项相等）。
+
+### 回滚
+
+```bash
+cd /opt/cpa
+# CPA 单独回退
+sed -i 's|whitelist-v7.3.18-norm2-gpt6|whitelist-v7.2.159-norm2-gpt6|' compose.yaml && docker compose up -d --no-deps cli-proxy-api
+# CPAMP 单独回退（需连同数据卷一起回退：v1.14.1 已把连接配置迁入加密 SQLite）
+sed -i 's|whitelist-v4|whitelist-v3|' compose.yaml && docker compose up -d --no-deps cpa-manager-plus
+```
+
+> 完整时间线（含备份路径、构建命令、灰度明细）见 [`docs/deployment.md`](docs/deployment.md)；补丁基线与文件清单见 [`patches/README.md`](patches/README.md)。
+
 
 ### 变更
 
