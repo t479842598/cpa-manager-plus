@@ -17,12 +17,12 @@
 
 | 服务 | 容器名 | 镜像 | 端口 |
 |---|---|---|---|
-| CPA | cli-proxy-api | eceasy/cli-proxy-api:whitelist-v7.3.18-norm2-gpt6 | 127.0.0.1:8317 |
+| CPA | cli-proxy-api | eceasy/cli-proxy-api:whitelist-v7.3.18-norm2-gpt6-sysmerge | 127.0.0.1:8317 |
 | CPAMP | cpa-manager-plus | seakee/cpa-manager-plus:whitelist-v4 | 127.0.0.1:18317 |
 
-> 当前版本：**CPA v7.3.18 + 白名单 + 消息归一化（norm1）+ 流式收尾修复（norm2）+ GPT-6 自动身份头（gpt6）+ 思考档位默认值修复 + api-key-models 管理端点**（2026-09-26 升级）
+> 当前版本：**CPA v7.3.18 + 白名单 + 消息归一化（norm1）+ 流式收尾修复（norm2）+ GPT-6 自动身份头（gpt6）+ 思考档位默认值修复 + api-key-models 管理端点 + system→user 合并（sysmerge）**（2026-09-27 新增 sysmerge）
 > + **CPAMP v1.14.1-whitelist-v4**（2026-09-26 升级，白名单改走管理端点即时落盘）。
-> 旧镜像 `:whitelist-v7.2.159-norm2-gpt6` / `:whitelist-v7.2.159-norm2` / `:whitelist-v7.2.157-norm2` / `:whitelist-v7.2.145-norm2` / `:whitelist-v7.2.145-norm1` / `:whitelist-v7.2.145` / `:whitelist` / `:latest` 与 CPAMP `:whitelist-v3` / `:whitelist-v2` / `:whitelist` / `:latest` 全部保留作回滚锚点。
+> 旧镜像 `:whitelist-v7.3.18-norm2-gpt6` / `:whitelist-v7.2.159-norm2-gpt6` / `:whitelist-v7.2.159-norm2` / `:whitelist-v7.2.157-norm2` / `:whitelist-v7.2.145-norm2` / `:whitelist-v7.2.145-norm1` / `:whitelist-v7.2.145` / `:whitelist` / `:latest` 与 CPAMP `:whitelist-v3` / `:whitelist-v2` / `:whitelist` / `:latest` 全部保留作回滚锚点。
 
 部署目录：`/opt/cpa/`（`compose.yaml`、`cli-config.yaml`、`secrets/`）
 
@@ -725,6 +725,95 @@ docker run --rm -v cpa_cpa-manager-plus-data:/data -v <备份目录>:/backup:ro 
 ```
 旧镜像 `eceasy/cli-proxy-api:whitelist`、`:latest` 与 `seakee/cpa-manager-plus:whitelist`、
 `:whitelist-v2` 均保留，勿执行 `docker image prune`。
+
+### 2026-09-27 新增 system→user 合并补丁（`whitelist-v7.3.18-norm2-gpt6` → `whitelist-v7.3.18-norm2-gpt6-sysmerge`）
+
+**触发**：ZCode（及 pi-web 同一上游）经 CPA 调 `北洛/deepseek-v4.1-flash` 稳定 400
+`{"error":{"message":"服务繁忙，请稍后重试（如持续出现请联系管理员）","type":"invalid_request_error"}}`，
+而同一上游的简单请求正常。
+
+**定位（可复现的最小条件）**：
+
+- 上游 `beiluoxi.top`（new-api 系）对 **`role: system` 消息**存在缺陷：
+  **同一内容 `system` → 400、`user` → 200**，交错对照 6 轮 + 4 轮 100% 稳定。
+- 短 system（如 `You are a helpful assistant.`）200，长 system（ZCode 10KB 系统提示）必 400。
+- **排除 CPA**：直连上游（绕过 CPA）用同一请求体同样 400；且 pi-web 的
+  `北洛Deepseek` provider 直连上游（`sk-18bb83512…`，与 CPA 同一把 key）也偶发同样 400。
+- 修复方案对比（均实测有效）：改 role / 合并进首条 user / 删除 system；
+  **选合并**（保留 system 指令语义，不降级为普通用户输入，也不丢内容）。
+
+**改动**：`openai-compatibility` provider 新增布尔开关 `merge-system-into-user`（缺省 false）。
+命中时在 openai-compat 执行器（非流式 + 流式两条路径）发请求前，把字符串型 system 消息按序拼接入首条 user；
+无 user 时在原位置生成等价 user 消息。补丁 30 → **35 文件**，新增回归测试 15 例。
+
+**备份**：`/opt/cpa/compose.yaml.bak-pre-sysmerge`、`/opt/cpa/cli-config.yaml.bak-pre-sysmerge`。
+
+**构建**（服务器原生 arm64，源码包 `cpa-sysmerge-build.tar.gz`）：
+```bash
+cd /tmp/cpa-sysmerge-build
+docker build --build-arg VERSION=v7.3.18 --build-arg COMMIT=ed980be3 \
+  --build-arg BUILD_DATE=2026-09-27T07:05:00Z \
+  -t eceasy/cli-proxy-api:whitelist-v7.3.18-norm2-gpt6-sysmerge .
+# → 6b017882d706
+```
+启动日志：`CLIProxyAPI Version: v7.3.18, Commit: ed980be3, BuiltAt: 2026-09-27T07:05:00Z`，
+21 个 OpenAI-compat 客户端（与切换前一致）。
+
+**灰度（8318 canary，配置副本，生产未动）**：
+
+| 验证项 | 结果 |
+|---|---|
+| 同一 276KB ZCode 请求体：生产 8317（旧镜像）| **400**（对照）|
+| 同一请求体：canary 8318（新镜像 + 开关）| **200** ✓ |
+| 北洛系 5 个模型（含 GPT-5.6 Sol / Grok 4.6 / k3 / glm-5.3）| 全 200 ✓ |
+| 白名单越权（tang1234 调未授权模型）| 403 ✓ |
+| 非北洛 provider（buddy / BAI / u1s1）| 全 200，不受影响 ✓ |
+| canary 日志 panic/fatal | 0 ✓ |
+
+**切换**（先镜像、后配置，分两步以便区分回归）：
+```bash
+cd /opt/cpa
+cp compose.yaml compose.yaml.bak-pre-sysmerge
+sed -i 's|whitelist-v7.3.18-norm2-gpt6$|whitelist-v7.3.18-norm2-gpt6-sysmerge|' compose.yaml
+docker compose up -d --no-deps cli-proxy-api
+# 此时开关未开：同一 276KB 请求体仍 400 → 证明默认关闭 = 行为逐字节不变
+python3 /tmp/mk_canary_config.py /tmp/cli-config.yaml.new   # 给 5 个北洛 provider 加开关
+cp /tmp/cli-config.yaml.new cli-config.yaml                 # 热重载
+```
+
+**生产复测（全过）**：
+
+| 验证项 | 期望 | 实测 |
+|---|---|---|
+| 开关未开时的 276KB ZCode 请求体 | 400（不变）| **400** ✓ |
+| 热重载日志 | `config successfully reloaded` | ✓（22 clients 重载）|
+| 开关开启后同一 276KB 请求体 ×3 | 200 | **200 / 200 / 200** ✓ |
+| 【闭环】同请求体直连上游（无改写）×2 | 400 | **400 / 400** ✓ |
+| 北洛系 6 个模型 | 200 | 全 200 ✓ |
+| 非北洛 provider（buddy / BAI / u1s1）| 200 | 全 200 ✓ |
+| 白名单越权 | 403 | **403** ✓ |
+| 公网 `api.274747.xyz/v1/models` | 200 | **200** ✓ |
+| 日志 panic/fatal | 0 | **0** ✓ |
+
+> 「同请求体直连上游 400 / 经 CPA 200」是本补丁生效的直接证据（同一文件、同一 key，唯一差异是是否经 CPA 改写）。
+
+**已知遗留（非本次引入）**：
+
+- `天机阁free/deepseek-v4-flash` 上游无可用渠道（`No available channel for model … under group Free-Model`），
+  生产模型列表已剔除该条，与新启 canary 的注册表差异为 1，与本补丁无关。
+- `FB/deepseek-v4-flash` 报 `unknown provider for model`（配置里 freebuff provider 的 alias 是
+  `FB/DeepSeek V4.1 Flash` 等带空格写法），改动前后一致，非回归。
+- pi-web 的 `北洛Deepseek` provider **直连上游不走 CPA**，因此不受本补丁保护；
+  如需同样豁免，把它改为走 CPA（`https://api.274747.xyz/v1` + 模型 `北洛/deepseek-v4.1-flash`）。
+
+**回滚**：
+```bash
+cd /opt/cpa
+cp compose.yaml.bak-pre-sysmerge compose.yaml   # 镜像标签回退
+cp cli-config.yaml.bak-pre-sysmerge cli-config.yaml  # 配置回退（去开关）
+docker compose up -d --no-deps cli-proxy-api
+```
+旧镜像 `:whitelist-v7.3.18-norm2-gpt6` 保留作回滚锚点。
 
 ## 常见运维操作
 

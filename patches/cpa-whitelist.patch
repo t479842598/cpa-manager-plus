@@ -932,6 +932,22 @@ index 00000000..5722188a
 +		t.Fatalf("reloaded whitelist = %#v, want empty", loadedCfg.APIKeyModels)
 +	}
 +}
+diff --git a/internal/config/config_types.go b/internal/config/config_types.go
+index 5afa2c44..c1f4aa7c 100644
+--- a/internal/config/config_types.go
++++ b/internal/config/config_types.go
+@@ -826,6 +826,11 @@ type OpenAICompatibility struct {
+ 
+ 	// RequestScopedErrors configures custom classification rules for upstream errors.
+ 	RequestScopedErrors []RequestScopedErrorRule `yaml:"request-scoped-errors,omitempty" json:"request-scoped-errors,omitempty"`
++
++	// MergeSystemIntoUser folds system messages into the first user message for upstreams
++	// that reject the system role (some new-api style relays answer 400 for it).
++	// Default false keeps the request body untouched.
++	MergeSystemIntoUser bool `yaml:"merge-system-into-user,omitempty" json:"merge-system-into-user,omitempty"`
+ }
+ 
+ // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
 diff --git a/internal/config/config_yaml.go b/internal/config/config_yaml.go
 index e1286353..09b0b3d7 100644
 --- a/internal/config/config_yaml.go
@@ -947,6 +963,108 @@ index e1286353..09b0b3d7 100644
  	replacePluginConfigsSubtree(original.Content[0], generated.Content[0])
  
  	// Merge generated into original in-place, preserving comments/order of existing nodes.
+diff --git a/internal/config/openai_compat_merge_system_test.go b/internal/config/openai_compat_merge_system_test.go
+new file mode 100644
+index 00000000..015a0598
+--- /dev/null
++++ b/internal/config/openai_compat_merge_system_test.go
+@@ -0,0 +1,96 @@
++package config
++
++import (
++	"testing"
++
++	"gopkg.in/yaml.v3"
++)
++
++func TestOpenAICompatibilityMergeSystemIntoUserConfigDecoding(t *testing.T) {
++	const yamlConfig = `openai-compatibility:
++  - name: beiluoxi
++    base-url: https://beiluoxi.top/v1
++    merge-system-into-user: true
++    api-key-entries:
++      - api-key: sk-test
++    models:
++      - name: deepseek-v4.1-flash
++        alias: 北洛/deepseek-v4.1-flash
++  - name: plain-upstream
++    base-url: https://example.com/v1
++    api-key-entries:
++      - api-key: sk-test-2
++    models:
++      - name: gpt-4o
++        alias: gpt-4o
++`
++
++	var cfg Config
++	if errDecode := yaml.Unmarshal([]byte(yamlConfig), &cfg); errDecode != nil {
++		t.Fatalf("decode error: %v", errDecode)
++	}
++
++	if len(cfg.OpenAICompatibility) != 2 {
++		t.Fatalf("openai-compatibility entries = %d, want 2", len(cfg.OpenAICompatibility))
++	}
++	if !cfg.OpenAICompatibility[0].MergeSystemIntoUser {
++		t.Fatalf("merge-system-into-user = false, want true: %+v", cfg.OpenAICompatibility[0])
++	}
++	if cfg.OpenAICompatibility[1].MergeSystemIntoUser {
++		t.Fatal("omitted merge-system-into-user must default to false")
++	}
++}
++
++func TestOpenAICompatibilityMergeSystemIntoUserSurvivesClone(t *testing.T) {
++	cfg := &Config{
++		OpenAICompatibility: []OpenAICompatibility{{
++			Name:                "beiluoxi",
++			BaseURL:             "https://beiluoxi.top/v1",
++			MergeSystemIntoUser: true,
++			APIKeyEntries:       []OpenAICompatibilityAPIKey{{APIKey: "sk-test"}},
++			Models:              []OpenAICompatibilityModel{{Name: "deepseek-v4.1-flash", Alias: "北洛/deepseek-v4.1-flash"}},
++		}},
++	}
++
++	clone := cfg.CloneForRuntime()
++	if clone == nil || len(clone.OpenAICompatibility) != 1 {
++		t.Fatal("clone lost openai-compatibility entries")
++	}
++	if !clone.OpenAICompatibility[0].MergeSystemIntoUser {
++		t.Fatal("CloneForRuntime dropped merge-system-into-user")
++	}
++
++	// Independent copies: mutating the clone must not affect the source.
++	clone.OpenAICompatibility[0].MergeSystemIntoUser = false
++	if !cfg.OpenAICompatibility[0].MergeSystemIntoUser {
++		t.Fatal("clone shares the flag with the source config")
++	}
++}
++
++func TestSanitizeOpenAICompatibilityKeepsMergeFlag(t *testing.T) {
++	cfg := &Config{
++		OpenAICompatibility: []OpenAICompatibility{
++			{
++				Name:                "  beiluoxi  ",
++				BaseURL:             "  https://beiluoxi.top/v1  ",
++				MergeSystemIntoUser: true,
++			},
++			{
++				Name:    "dropped",
++				BaseURL: "   ",
++			},
++		},
++	}
++
++	cfg.SanitizeOpenAICompatibility()
++
++	if len(cfg.OpenAICompatibility) != 1 {
++		t.Fatalf("entries after sanitize = %d, want 1", len(cfg.OpenAICompatibility))
++	}
++	if !cfg.OpenAICompatibility[0].MergeSystemIntoUser {
++		t.Fatal("sanitize dropped the merge flag")
++	}
++	if cfg.OpenAICompatibility[0].Name != "beiluoxi" {
++		t.Fatalf("name = %q, want trimmed", cfg.OpenAICompatibility[0].Name)
++	}
++}
 diff --git a/internal/config/sdk_config.go b/internal/config/sdk_config.go
 index 5e4077b9..2ad1dad1 100644
 --- a/internal/config/sdk_config.go
@@ -1321,11 +1439,392 @@ index 00000000..323b271f
 +		t.Fatalf("headers = %#v, want empty for blank model", headers)
 +	}
 +}
+diff --git a/internal/runtime/executor/helps/openai_compat_system_role.go b/internal/runtime/executor/helps/openai_compat_system_role.go
+new file mode 100644
+index 00000000..055ba20b
+--- /dev/null
++++ b/internal/runtime/executor/helps/openai_compat_system_role.go
+@@ -0,0 +1,150 @@
++package helps
++
++import (
++	"strings"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/tidwall/gjson"
++	"github.com/tidwall/sjson"
++)
++
++// ShouldMergeSystemIntoUser reports whether the selected openai-compatibility provider
++// asked for system messages to be folded into the first user message.
++//
++// Some OpenAI-compatible relays (new-api style) reject the system role outright with a
++// generic 400 ("service temporarily unavailable"), which breaks clients that ship a large
++// system prompt (e.g. ZCode sends a ~10KB system message). The flag is provider scoped
++// because the defect lives in the relay, not in a specific model, so no per-model
++// override is needed.
++func ShouldMergeSystemIntoUser(compat *config.OpenAICompatibility) bool {
++	if compat == nil {
++		return false
++	}
++	return compat.MergeSystemIntoUser
++}
++
++// MergeSystemMessagesIntoUser rewrites the messages array so that no string-content
++// system message remains:
++//
++//   - string-content system messages are collected in order and prepended (separated by a
++//     blank line) to the first user message, which preserves the instruction semantics
++//     instead of degrading it to a plain user turn;
++//   - when there is no string-content user message to attach to, the collected text is
++//     emitted as a user message inserted before the first non-assistant message, so the
++//     content is never dropped;
++//   - system messages carrying array content are left untouched (their structure is not
++//     guessed);
++//   - empty system messages are dropped.
++//
++// The function is a no-op (and returns the caller's slice) when there is nothing to do,
++// which keeps the disabled path allocation free.
++func MergeSystemMessagesIntoUser(payload []byte) []byte {
++	messages := gjson.GetBytes(payload, "messages")
++	if !messages.Exists() || !messages.IsArray() {
++		return payload
++	}
++
++	rawList := messages.Array()
++	if len(rawList) == 0 {
++		return payload
++	}
++
++	kept := make([][]byte, 0, len(rawList)+1)
++	pending := make([]string, 0, 2)
++	sawMergeableSystem := false
++	// Index in `kept` where the first dropped system message used to sit, so a synthetic
++	// user turn can be put back at the same relative position.
++	firstSystemAt := 0
++
++	for _, msg := range rawList {
++		if msg.Get("role").String() != "system" {
++			kept = append(kept, []byte(msg.Raw))
++			continue
++		}
++
++		content := msg.Get("content")
++		// Array content is structured (multimodal parts); rewriting it would require
++		// guessing the upstream schema, so such messages are preserved verbatim.
++		if content.IsArray() {
++			kept = append(kept, []byte(msg.Raw))
++			continue
++		}
++
++		if !sawMergeableSystem {
++			firstSystemAt = len(kept)
++		}
++		sawMergeableSystem = true
++		if text := content.String(); text != "" {
++			pending = append(pending, text)
++		}
++		// Empty (or missing) system messages contribute nothing and are dropped.
++	}
++
++	if !sawMergeableSystem {
++		return payload
++	}
++
++	merged := strings.Join(pending, "\n\n")
++	attached := false
++
++	if merged != "" {
++		for i := range kept {
++			if gjson.GetBytes(kept[i], "role").String() != "user" {
++				continue
++			}
++			existing := gjson.GetBytes(kept[i], "content")
++			if existing.Type != gjson.String {
++				// Multimodal user content cannot be prefixed with plain text without
++				// guessing the schema; skip it and keep looking for a text user turn.
++				continue
++			}
++			combined := merged
++			if existing.String() != "" {
++				combined = merged + "\n\n" + existing.String()
++			}
++			updated, errSet := sjson.SetBytes(kept[i], "content", combined)
++			if errSet != nil {
++				continue
++			}
++			kept[i] = updated
++			attached = true
++			break
++		}
++	}
++
++	if !attached && merged != "" {
++		// No attachable user turn: emit the text as a user message at the position the first
++		// system message used to occupy, so ordering relative to assistant turns is kept.
++		synthetic := []byte(`{"role":"user","content":""}`)
++		if updated, errSet := sjson.SetBytes(synthetic, "content", merged); errSet == nil {
++			synthetic = updated
++		}
++		insertAt := firstSystemAt
++		if insertAt > len(kept) {
++			insertAt = len(kept)
++		}
++		// Build a fresh slice rather than shifting in place: the repository keeps request
++		// payload buffers immutable, and the no-copy invariant test rejects copy() over them.
++		withSynthetic := make([][]byte, 0, len(kept)+1)
++		withSynthetic = append(withSynthetic, kept[:insertAt]...)
++		withSynthetic = append(withSynthetic, synthetic)
++		withSynthetic = append(withSynthetic, kept[insertAt:]...)
++		kept = withSynthetic
++	}
++
++	if len(kept) == 0 {
++		// Every message was an empty system message; keep the array shape valid.
++		kept = append(kept, []byte(`{"role":"user","content":""}`))
++	}
++
++	// Rebuild the messages array in one write so indices never shift mid-edit.
++	encoded := make([]string, 0, len(kept))
++	for _, raw := range kept {
++		encoded = append(encoded, string(raw))
++	}
++	out, errSet := sjson.SetRawBytes(payload, "messages", []byte("["+strings.Join(encoded, ",")+"]"))
++	if errSet != nil {
++		return payload
++	}
++	return out
++}
+diff --git a/internal/runtime/executor/helps/openai_compat_system_role_test.go b/internal/runtime/executor/helps/openai_compat_system_role_test.go
+new file mode 100644
+index 00000000..67231f1c
+--- /dev/null
++++ b/internal/runtime/executor/helps/openai_compat_system_role_test.go
+@@ -0,0 +1,209 @@
++package helps
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	"github.com/tidwall/gjson"
++)
++
++func TestShouldMergeSystemIntoUser(t *testing.T) {
++	t.Run("nil compat returns false", func(t *testing.T) {
++		if ShouldMergeSystemIntoUser(nil) {
++			t.Fatal("nil compat must not enable merging")
++		}
++	})
++
++	t.Run("omitted flag defaults to false", func(t *testing.T) {
++		if ShouldMergeSystemIntoUser(&config.OpenAICompatibility{Name: "beiluoxi"}) {
++			t.Fatal("omitted merge-system-into-user must default to false")
++		}
++	})
++
++	t.Run("explicit true enables merging", func(t *testing.T) {
++		if !ShouldMergeSystemIntoUser(&config.OpenAICompatibility{Name: "beiluoxi", MergeSystemIntoUser: true}) {
++			t.Fatal("merge-system-into-user: true must enable merging")
++		}
++	})
++}
++
++func TestMergeSystemMessagesIntoUserNoopWhenNothingToDo(t *testing.T) {
++	cases := map[string]string{
++		"no messages key":     `{"model":"m","input":"hi"}`,
++		"messages not array":  `{"model":"m","messages":"oops"}`,
++		"empty messages":      `{"model":"m","messages":[]}`,
++		"no system message":   `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
++		"array system only":   `{"model":"m","messages":[{"role":"system","content":[{"type":"text","text":"s"}]},{"role":"user","content":"hi"}]}`,
++		"developer untouched": `{"model":"m","messages":[{"role":"developer","content":"d"},{"role":"user","content":"hi"}]}`,
++	}
++
++	for name, input := range cases {
++		t.Run(name, func(t *testing.T) {
++			// The slice identity must be preserved so the disabled path stays allocation free.
++			payload := []byte(input)
++			got := MergeSystemMessagesIntoUser(payload)
++			if len(got) != len(payload) || &got[0] != &payload[0] {
++				t.Fatalf("payload should be returned untouched, got %s", string(got))
++			}
++		})
++	}
++}
++
++func TestMergeSystemMessagesIntoUserSingleSystem(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[` +
++		`{"role":"system","content":"You are a helpful assistant."},` +
++		`{"role":"user","content":"hello"}]}`)
++
++	got := MergeSystemMessagesIntoUser(input)
++
++	messages := gjson.GetBytes(got, "messages").Array()
++	if len(messages) != 1 {
++		t.Fatalf("expected the system message to be folded away, got %d messages: %s", len(messages), string(got))
++	}
++	if role := messages[0].Get("role").String(); role != "user" {
++		t.Fatalf("remaining role = %q, want user", role)
++	}
++	want := "You are a helpful assistant.\n\nhello"
++	if content := messages[0].Get("content").String(); content != want {
++		t.Fatalf("merged content = %q, want %q", content, want)
++	}
++	if model := gjson.GetBytes(got, "model").String(); model != "m" {
++		t.Fatalf("unrelated fields must survive, model = %q", model)
++	}
++}
++
++func TestMergeSystemMessagesIntoUserKeepsOtherRoles(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[` +
++		`{"role":"system","content":"S1"},` +
++		`{"role":"user","content":"U1"},` +
++		`{"role":"assistant","content":"A1"},` +
++		`{"role":"user","content":"U2"}]}`)
++
++	got := MergeSystemMessagesIntoUser(input)
++
++	messages := gjson.GetBytes(got, "messages").Array()
++	if len(messages) != 3 {
++		t.Fatalf("expected 3 messages, got %d: %s", len(messages), string(got))
++	}
++	if content := messages[0].Get("content").String(); content != "S1\n\nU1" {
++		t.Fatalf("first kept message content = %q, want %q", content, "S1\n\nU1")
++	}
++	if role := messages[1].Get("role").String(); role != "assistant" {
++		t.Fatalf("assistant ordering broken, got role %q", role)
++	}
++	if content := messages[2].Get("content").String(); content != "U2" {
++		t.Fatalf("second user message must stay untouched, got %q", content)
++	}
++}
++
++func TestMergeSystemMessagesIntoUserMultipleSystemsInOrder(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[` +
++		`{"role":"system","content":"first"},` +
++		`{"role":"user","content":"keep"},` +
++		`{"role":"system","content":"second"},` +
++		`{"role":"user","content":"user2"}]}`)
++
++	got := MergeSystemMessagesIntoUser(input)
++
++	messages := gjson.GetBytes(got, "messages").Array()
++	if len(messages) != 2 {
++		t.Fatalf("expected 2 messages, got %d: %s", len(messages), string(got))
++	}
++	want := "first\n\nsecond\n\nkeep"
++	if content := messages[0].Get("content").String(); content != want {
++		t.Fatalf("merged content = %q, want %q", content, want)
++	}
++}
++
++func TestMergeSystemMessagesIntoUserDropsEmptySystem(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[` +
++		`{"role":"system","content":""},` +
++		`{"role":"user","content":"hello"}]}`)
++
++	got := MergeSystemMessagesIntoUser(input)
++
++	messages := gjson.GetBytes(got, "messages").Array()
++	if len(messages) != 1 {
++		t.Fatalf("empty system should be dropped without adding content, got %d messages: %s", len(messages), string(got))
++	}
++	if content := messages[0].Get("content").String(); content != "hello" {
++		t.Fatalf("content = %q, want %q", content, "hello")
++	}
++}
++
++func TestMergeSystemMessagesIntoUserWithoutUserMessage(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[` +
++		`{"role":"system","content":"only system"},` +
++		`{"role":"assistant","content":"A1"}]}`)
++
++	got := MergeSystemMessagesIntoUser(input)
++
++	messages := gjson.GetBytes(got, "messages").Array()
++	if len(messages) != 2 {
++		t.Fatalf("expected system to be converted, got %d messages: %s", len(messages), string(got))
++	}
++	if role := messages[0].Get("role").String(); role != "user" {
++		t.Fatalf("first message role = %q, want user", role)
++	}
++	if content := messages[0].Get("content").String(); content != "only system" {
++		t.Fatalf("system content must not be dropped, got %q", content)
++	}
++	if role := messages[1].Get("role").String(); role != "assistant" {
++		t.Fatalf("assistant message must be preserved, got role %q", role)
++	}
++}
++
++func TestMergeSystemMessagesIntoUserWithMultimodalUserKeepsLooking(t *testing.T) {
++	input := []byte(`{"model":"m","messages":[` +
++		`{"role":"system","content":"sys"},` +
++		`{"role":"user","content":[{"type":"text","text":"see image"},{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]},` +
++		`{"role":"user","content":"plain"}]}`)
++
++	got := MergeSystemMessagesIntoUser(input)
++
++	messages := gjson.GetBytes(got, "messages").Array()
++	if len(messages) != 2 {
++		t.Fatalf("expected 2 messages, got %d: %s", len(messages), string(got))
++	}
++	if !messages[0].Get("content").IsArray() {
++		t.Fatalf("multimodal user content must stay an array, got %s", messages[0].Get("content").Raw)
++	}
++	if content := messages[1].Get("content").String(); content != "sys\n\nplain" {
++		t.Fatalf("system text should attach to the next text user turn, got %q", content)
++	}
++}
++
++func TestMergeSystemMessagesIntoUserProducesValidJSONForLargePayload(t *testing.T) {
++	bigSystem := strings.Repeat("System instruction line with \"quotes\" and \\backslash.\n", 4000)
++	userTurns := `{"role":"user","content":"` + strings.Repeat("user text ", 500) + `"}`
++	input := []byte(`{"model":"m","stream":true,"tools":[{"type":"function","function":{"name":"t"}}],"messages":[` +
++		`{"role":"system","content":` + mustJSONString(bigSystem) + `},` +
++		userTurns + `]}`)
++
++	got := MergeSystemMessagesIntoUser(input)
++
++	if !gjson.ValidBytes(got) {
++		t.Fatal("merged payload must stay valid JSON")
++	}
++	messages := gjson.GetBytes(got, "messages").Array()
++	if len(messages) != 1 {
++		t.Fatalf("expected 1 message, got %d", len(messages))
++	}
++	content := messages[0].Get("content").String()
++	if !strings.HasPrefix(content, "System instruction line") {
++		t.Fatalf("merged content must start with the system text, got %.80q", content)
++	}
++	if !strings.Contains(content, "user text") {
++		t.Fatal("original user text must be preserved after the system text")
++	}
++	if len(gjson.GetBytes(got, "tools").Array()) != 1 {
++		t.Fatal("unrelated top-level fields must survive the rewrite")
++	}
++}
++
++// mustJSONString quotes a string for embedding inside a hand written JSON literal.
++func mustJSONString(s string) string {
++	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\r", `\r`, "\t", `\t`)
++	return `"` + replacer.Replace(s) + `"`
++}
 diff --git a/internal/runtime/executor/openai_compat_executor.go b/internal/runtime/executor/openai_compat_executor.go
-index 8032fe44..43b2a736 100644
+index 8032fe44..a9452eee 100644
 --- a/internal/runtime/executor/openai_compat_executor.go
 +++ b/internal/runtime/executor/openai_compat_executor.go
-@@ -308,6 +308,59 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
+@@ -136,6 +136,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
+ 		if err != nil {
+ 			return resp, err
+ 		}
++		if helps.ShouldMergeSystemIntoUser(e.resolveCompatConfig(auth)) {
++			translated = helps.MergeSystemMessagesIntoUser(translated)
++		}
+ 	}
+ 	if opts.Alt == "responses/compact" {
+ 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
+@@ -308,6 +311,59 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
  	return resp, nil
  }
  
@@ -1385,7 +1884,17 @@ index 8032fe44..43b2a736 100644
  func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
  	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
  	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
-@@ -432,6 +485,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+@@ -354,6 +410,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if helps.ShouldMergeSystemIntoUser(e.resolveCompatConfig(auth)) {
++			translated = helps.MergeSystemMessagesIntoUser(translated)
++		}
+ 	}
+ 
+ 	// Request usage data in the final streaming chunk so that token statistics
+@@ -432,6 +491,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
  		var streamAborted bool
  		var upstreamEvent string
  		var frameData [][]byte
@@ -1399,7 +1908,7 @@ index 8032fe44..43b2a736 100644
  		defer streamUsage.Publish(ctx, reporter)
  
  		publishStreamError := func(streamErr statusErr, containsPayload bool) {
-@@ -448,6 +508,33 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+@@ -448,6 +514,33 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
  			streamFailed = true
  		}
  
@@ -1433,7 +1942,7 @@ index 8032fe44..43b2a736 100644
  		processFrame := func() bool {
  			eventName := upstreamEvent
  			upstreamEvent = ""
-@@ -484,6 +571,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+@@ -484,6 +577,23 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
  					publishStreamError(streamErr, true)
  					return true
  				}
@@ -1457,7 +1966,7 @@ index 8032fe44..43b2a736 100644
  			}
  
  			streamLine := append([]byte("data: "), dataPayload...)
-@@ -561,6 +665,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
+@@ -561,6 +671,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
  			}
  
  			// Other protocols retain compatibility with providers that omit [DONE].
@@ -1604,6 +2113,137 @@ index 00000000..af91a3bf
 +	payloads := runFinishRepairStream(t, "data: [DONE]\n\n")
 +	if got := countFinishReasonChunks(payloads); got != 0 {
 +		t.Fatalf("finish_reason chunks = %d, want 0 for empty stream; payloads=%v", got, payloads)
++	}
++}
+diff --git a/internal/runtime/executor/openai_compat_executor_merge_system_test.go b/internal/runtime/executor/openai_compat_executor_merge_system_test.go
+new file mode 100644
+index 00000000..6438ccad
+--- /dev/null
++++ b/internal/runtime/executor/openai_compat_executor_merge_system_test.go
+@@ -0,0 +1,125 @@
++package executor
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
++	"github.com/tidwall/gjson"
++)
++
++// newMergeSystemTestExecutor wires an httptest upstream that records the outbound body,
++// mirroring the setup used by the max-tokens normalization tests.
++func newMergeSystemTestExecutor(t *testing.T, merge bool, streamResponse string) (*OpenAICompatExecutor, *cliproxyauth.Auth, *[]byte) {
++	t.Helper()
++
++	var gotBody []byte
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(r.Body)
++		gotBody = body
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(streamResponse))
++	}))
++	t.Cleanup(server.Close)
++
++	cfg := &config.Config{
++		OpenAICompatibility: []config.OpenAICompatibility{{
++			Name:                "test-compat",
++			BaseURL:             server.URL + "/v1",
++			MergeSystemIntoUser: merge,
++			Models: []config.OpenAICompatibilityModel{
++				{Name: "upstream-model", Alias: "alias-model"},
++			},
++		}},
++	}
++
++	auth := &cliproxyauth.Auth{
++		Provider: "openai-compatibility",
++		Attributes: map[string]string{
++			"base_url":     server.URL + "/v1",
++			"api_key":      "test-key",
++			"compat_name":  "test-compat",
++			"provider_key": "test-compat",
++		},
++	}
++
++	return NewOpenAICompatExecutor("openai-compatibility", cfg), auth, &gotBody
++}
++
++const mergeSystemChatResponse = `{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`
++
++const mergeSystemStreamResponse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
++
++func TestOpenAICompatExecutorSystemMergeDisabledLeavesBodyUntouched(t *testing.T) {
++	executor, auth, gotBody := newMergeSystemTestExecutor(t, false, mergeSystemChatResponse)
++
++	payload := []byte(`{"model":"alias-model","messages":[{"role":"system","content":"sys prompt"},{"role":"user","content":"hello"}]}`)
++	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "alias-model",
++		Payload: payload,
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}); err != nil {
++		t.Fatalf("Execute error: %v", err)
++	}
++
++	messages := gjson.GetBytes(*gotBody, "messages").Array()
++	if len(messages) != 2 {
++		t.Fatalf("disabled flag must not rewrite messages, got %d: %s", len(messages), string(*gotBody))
++	}
++	if role := messages[0].Get("role").String(); role != "system" {
++		t.Fatalf("disabled flag must keep the system role, got %q", role)
++	}
++}
++
++func TestOpenAICompatExecutorSystemMergeEnabledRewritesNonStreamBody(t *testing.T) {
++	executor, auth, gotBody := newMergeSystemTestExecutor(t, true, mergeSystemChatResponse)
++
++	payload := []byte(`{"model":"alias-model","messages":[{"role":"system","content":"sys prompt"},{"role":"user","content":"hello"}]}`)
++	if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "alias-model",
++		Payload: payload,
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")}); err != nil {
++		t.Fatalf("Execute error: %v", err)
++	}
++
++	messages := gjson.GetBytes(*gotBody, "messages").Array()
++	if len(messages) != 1 {
++		t.Fatalf("expected the system message to be folded away, got %d: %s", len(messages), string(*gotBody))
++	}
++	if role := messages[0].Get("role").String(); role != "user" {
++		t.Fatalf("remaining role = %q, want user", role)
++	}
++	if content := messages[0].Get("content").String(); content != "sys prompt\n\nhello" {
++		t.Fatalf("merged content = %q, want %q", content, "sys prompt\n\nhello")
++	}
++}
++
++func TestOpenAICompatExecutorSystemMergeEnabledRewritesStreamBody(t *testing.T) {
++	executor, auth, gotBody := newMergeSystemTestExecutor(t, true, mergeSystemStreamResponse)
++
++	payload := []byte(`{"model":"alias-model","messages":[{"role":"system","content":"stream sys"},{"role":"user","content":"hello"}],"stream":true}`)
++	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
++		Model:   "alias-model",
++		Payload: payload,
++	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Stream: true})
++	if err != nil {
++		t.Fatalf("ExecuteStream error: %v", err)
++	}
++	for range stream.Chunks {
++		// Drain so the upstream request is fully issued.
++	}
++
++	messages := gjson.GetBytes(*gotBody, "messages").Array()
++	if len(messages) != 1 {
++		t.Fatalf("streaming path must also fold the system message, got %d: %s", len(messages), string(*gotBody))
++	}
++	if content := messages[0].Get("content").String(); !strings.HasPrefix(content, "stream sys") {
++		t.Fatalf("streaming merged content = %q, want prefix %q", content, "stream sys")
 +	}
 +}
 diff --git a/internal/translator/openai/openai/chat-completions/openai_openai_request.go b/internal/translator/openai/openai/chat-completions/openai_openai_request.go

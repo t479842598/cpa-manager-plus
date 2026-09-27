@@ -6,7 +6,7 @@
 
 | 补丁 | 上游基线 | 文件数 | 校验状态 |
 |---|---|---|---|
-| `cpa-whitelist.patch` | `router-for-me/CLIProxyAPI` **v7.3.18** | 30（白名单 14 + 消息归一化 2 + 流式收尾修复 2 + GPT-6 自动身份头 4 + **思考档位默认值 3** + **api-key-models 管理端点 2** + **config.yaml prune 1 + 测试 2**） | 干净 v7.3.18 worktree 上 `git apply --check`（plain，无需 `--3way`，无空白告警）+ 30/30 文件逐字节一致 + `go build ./...` 退出码 0 + `go test ./...` 97 包全过 + 沙箱灰度 23/23 |
+| `cpa-whitelist.patch` | `router-for-me/CLIProxyAPI` **v7.3.18** | 35（白名单 14 + 消息归一化 2 + 流式收尾修复 2 + GPT-6 自动身份头 4 + **思考档位默认值 3** + **api-key-models 管理端点 2** + **config.yaml prune 1 + 测试 2** + **system→user 合并 5**） | 干净 v7.3.18 worktree 上 `git apply --check`（plain，无需 `--3way`，无空白告警）+ 35 文件回放后 `go build ./...` 退出码 0 + 新回归测试全过 + 生产灰度对照（同请求体：直连上游 400 / 经 CPA 200） |
 | `cpamp-whitelist.patch` | `seakee/CPA-Manager-Plus` **v1.14.1** | 9（2 个新文件：`apiKeyModels.ts` + 其测试） | 干净 v1.14.1 worktree 上 `git apply --check`（plain）+ 9/9 文件逐字节一致 + `tsc --noEmit` + `vitest`(4174) + 仓库级测试(257) + `vite build` 全通过 |
 
 > ### 2026-09-26 升级基线 **CPA v7.2.159 → v7.3.18** + **CPAMP v1.12.5 → v1.14.1**（616 个上游提交）
@@ -102,7 +102,7 @@ git diff HEAD > ../../patches/<name>.patch
 
 ```bash
 # 1) 文件数应等于预期（CPA 当前 30 / CPAMP 当前 9）
-grep -c '^diff --git' ../../patches/cpa-whitelist.patch     # 期望 30
+grep -c '^diff --git' ../../patches/cpa-whitelist.patch     # 期望 35
 grep -c '^diff --git' ../../patches/cpamp-whitelist.patch   # 期望 9
 
 # 2) 关键修复不得缺失（白名单 / norm1 / norm2 / gpt6 / 思考档位 / 新端点 / prune）
@@ -152,6 +152,12 @@ cd /tmp/patchcheck && git apply --check ../../patches/cpa-whitelist.patch \
 | `internal/translator/openai/openai/chat-completions/openai_openai_request.go` | **消息归一化**：转发 openai-compat 上游前 developer→system、assistant thinking 块抽成 reasoning_content、每条 assistant 补 reasoning_content（DeepSeek thinking 模式要求），纯字符串消息零拷贝原样返回 |
 | `internal/translator/openai/openai/chat-completions/openai_openai_request_test.go` | **新增**：归一化回归测试 5 例（developer→system / thinking 折叠 / 补空 rc / user image 不动 / 零拷贝保持） |
 | `internal/runtime/executor/openai_compat_executor.go` | **流式收尾修复（norm2）**：跟踪上游是否发过非空 `finish_reason` / 是否推过 `tool_calls` delta / 是否有过 choice 内容；流干净结束（`[DONE]` 或 EOF 补发 `[DONE]`）且「有内容但缺收尾帧」时，在 `[DONE]` 之前合成标准 `chat.completion.chunk`（`finish_reason` 取 `tool_calls`/`stop`，复用上游 id/model），解决 pi-ai `Stream ended without finish_reason`。新增 `openAIStreamTerminalInfo` / `synthesizeOpenAIStreamFinish` 辅助函数 |
+| `internal/runtime/executor/helps/openai_compat_system_role.go` | **新增（system→user 合并）**：`ShouldMergeSystemIntoUser(compat)` + `MergeSystemMessagesIntoUser(payload)` —— 把字符串型 `system` 消息按序用空行拼接入首条 `user`（保语义），无 user 时在原位置生成等价 user 消息（不丢内容），数组型 content 与空 content 各自保留/丢弃；无待合并项时零拷贝返回 |
+| `internal/runtime/executor/helps/openai_compat_system_role_test.go` | **新增**：9 例（nil/缺省 false/true 开关、零拷贝六种无操作场景、单 system 合并、保序与其它角色不动、多 system 按序、空 system 丢弃、无 user 兜底、数组 content 跳过、大 payload JSON 有效） |
+| `internal/runtime/executor/openai_compat_executor_merge_system_test.go` | **新增**：3 例（开关关闭不改写出站 body、开关开启非流式改写、开关开启流式改写）——覆盖执行器两条路径 |
+| `internal/config/openai_compat_merge_system_test.go` | **新增**：3 例（yaml 解析 true/缺省 false、`CloneForRuntime` 保留且不共享、`SanitizeOpenAICompatibility` 不丢字段） |
+| `internal/runtime/executor/openai_compat_executor.go` | **system→user 合并接入**：非流式 `Execute` 与流式 `ExecuteStream` 在 `NormalizeOpenAIMaxTokens` 之后、构造 httpReq 之前，按 `merge-system-into-user` 开关调用合并 |
+| `internal/config/config_types.go` | `OpenAICompatibility` 新增 `MergeSystemIntoUser bool`（yaml/json `merge-system-into-user`，omitempty，缺省 false） |
 | `internal/runtime/executor/openai_compat_executor_finish_test.go` | **新增**：收尾合成回归测试 5 例（缺收尾补 stop / tool_calls 补 tool_calls / 已有收尾不重复 / EOF 无 DONE 也补 / 空流不补） |
 | `internal/runtime/executor/codex_executor_request.go` | **GPT-6 自动身份头（gpt6）**：新增 `isGPT6FamilyModel`（`gpt-6` / `gpt-6-*` / `gpt-6.*`，含 `team/gpt-6-astra` 前缀与思考后缀）、`isOfficialCodexBaseURL`、`hasOperatorHeader`、`applyGPT6CodexIdentityHeaders` —— 命中 GPT-6 家族且上游非官方时强制 `Originator: codex_exec` + `codex_exec` UA（缺失时补 `Session_id`），让位于 provider `headers` 与 `config.override_header` |
 | `internal/runtime/executor/codex_executor_execute.go` | 流式与 `/responses/compact` 两条路径在 `applyCodexHeaders` 之后调用 `applyGPT6CodexIdentityHeaders` |
@@ -213,7 +219,7 @@ v1.12.5 → v1.14.1 跨了 616 个上游提交，本补丁触及的 `ApiKeysCard
 
 ## 备份位置
 
-- `src/cli-proxy-api/` — **v7.3.18** + 本补丁（30 文件），与生产构建逐文件一致
+- `src/cli-proxy-api/` — **v7.3.18** + 本补丁（35 文件），与生产构建逐文件一致
 - `src/cpa-manager-plus/` — **v1.14.1** + 本补丁（9 文件），与生产构建逐文件一致
 - `src/backup/cpa-src-whitelist-full-v7.2.145-norm2.tar.gz` — 升级前 v7.2.145 完整源码（含白名单+norm1+norm2，历史锚点）
 - `src/backup/cpa-src-whitelist-full-v7.2.143.tar.gz` — 生产镜像 `:whitelist` 的原始完整源码（更早锚点）

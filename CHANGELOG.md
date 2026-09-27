@@ -8,6 +8,65 @@
 
 ---
 
+## 2026-09-27 — 新增 system→user 合并补丁，修复 ZCode 经 CPA 调北洛必 400（正式标签 `whitelist-v7.3.18-norm2-gpt6-sysmerge`，已部署生产）
+
+### 修复
+
+- **北洛上游对 `role: system` 的 400（本轮触发问题）**：ZCode 经 CPA 调 `北洛/deepseek-v4.1-flash` 稳定返回
+  `400 {"error":{"message":"服务繁忙，请稍后重试（如持续出现请联系管理员）","type":"invalid_request_error"}}`，
+  而同一上游的简单请求正常。
+  - **定位**：上游 `beiluoxi.top`（new-api 系）对 system 消息存在缺陷——**同一内容 `system` → 400、`user` → 200**
+    （交错对照 6 轮 + 4 轮，100% 稳定）；短 system（`You are a helpful assistant.`）200、ZCode 的 10KB system 必 400。
+  - **先排除 CPA**：直连上游（绕过 CPA）用同一 276KB 请求体同样 400；且日志证据显示 pi-web 的
+    `北洛Deepseek` provider 直连上游（同一把 key `sk-18bb83512…`）也会偶发同样 400。
+  - **修复方案选型**：改 role / 合并进首条 user / 删除 system 三套均实测有效；选**合并**（保留 system 指令语义，
+    不降级为普通用户输入，也不丢内容）。
+
+### 新增
+
+- **`openai-compatibility` provider 级开关 `merge-system-into-user`**（缺省 false）：命中时在 openai-compat 执行器
+  （非流式 `Execute` + 流式 `ExecuteStream` 两条路径）发请求前，把字符串型 `system` 消息按序用空行拼接入首条 `user`；
+  无 user 时在原位置生成等价 user 消息（不丢内容）；数组型 content 保持原样、空 content 直接丢弃；无待合并项时零拷贝返回。
+- 回归测试 **15 例**：helps 包 9 例（开关与零拷贝、单/多 system、保序、无 user 兜底、数组 content、大 payload JSON 有效）、
+  执行器 3 例（关闭不改写 / 开启改非流式 / 开启改流式）、config 3 例（yaml 解析、clone 不共享、sanitize 不丢字段）。
+  另修一处上游不变量告警：`internal/util/nocopy_invariant_test.go` 禁止对 payload 缓冲做原地 `copy()`，
+  插入合成 user 消息改用 append 重构切片。
+
+### 变更
+
+- **补丁 30 → 35 文件**（新增 4 文件 + 改 `config_types.go`）；镜像 `whitelist-v7.3.18-norm2-gpt6` →
+  `whitelist-v7.3.18-norm2-gpt6-sysmerge`（ID `6b017882d706`，服务器原生 arm64 构建）。
+  旧镜像全部保留作回滚锚点（未执行 `docker image prune`）。
+- 生产配置（`/opt/cpa/cli-config.yaml`）**只增不改**：给 5 个北洛系 provider（`北洛` / `北洛 grok` /
+  `北洛 DeepSeek` / `北洛国模福利` / `北洛 glm`，均为 `base-url: https://beiluoxi.top/v1`）各加一行
+  `merge-system-into-user: true`，其余配置零改动。
+- 上游基线不变（v7.3.18），补丁在干净 v7.3.18 worktree 上 plain `git apply --check` 通过、35 文件回放后
+  `go build ./...` 退出码 0、全量 `go test ./...` 通过。
+
+### 部署与验证
+
+- 备份：`/opt/cpa/compose.yaml.bak-pre-sysmerge`、`/opt/cpa/cli-config.yaml.bak-pre-sysmerge`。
+- 灰度：8318 canary（新镜像 + 配置副本）——同一 276KB ZCode 请求体 **生产 400 / canary 200**；
+  北洛系 5 模型全 200；白名单越权 403；非北洛 provider 不受影响；日志 panic/fatal 0。
+- 切换分两步以区分回归：① 先换镜像（开关未开）→ 同一请求体**仍 400**，证明默认关闭行为不变；
+  ② 再加热载配置开关。
+- 生产复测：目标请求体 ×3 全 **200**（修复前 100% 400）；北洛系 6 模型全 200；非北洛 provider 全 200；
+  白名单越权 **403**；公网 `api.274747.xyz/v1/models` **200**；panic/fatal **0**。
+- **生效闭环证据**：同一文件、同一 key，直连上游（无改写）**400 / 400**，经 CPA（有改写）**200**。
+- 灰度容器已清理（`docker rm -f cpa-canary`）。
+
+### 已知遗留（非本次引入）
+
+- `天机阁free/deepseek-v4-flash` 上游无可用渠道（`No available channel for model … under group Free-Model`），
+  生产模型列表已剔除该条，与新启 canary 的注册表差异为 1，与本补丁无关。
+- `FB/deepseek-v4-flash` 报 `unknown provider for model`（配置里 freebuff provider 的 alias 是
+  `FB/DeepSeek V4.1 Flash` 等带空格写法），改动前后一致，非回归。
+- **pi-web 的 `北洛Deepseek` provider 直连上游、不走 CPA**，因此不在本补丁保护范围内；
+  如需同样豁免，可改为走 CPA（`https://api.274747.xyz/v1` + 模型 `北洛/deepseek-v4.1-flash`）。
+
+---
+
+
 ## 2026-09-26 — 升级 CPA v7.3.18 + CPAMP v1.14.1，修复「思考强度 max 被夹成 high」（正式标签 `whitelist-v7.3.18-norm2-gpt6` / `whitelist-v4`，已部署生产）
 
 ### 修复
